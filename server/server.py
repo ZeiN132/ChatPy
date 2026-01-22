@@ -7,7 +7,7 @@ from bcrypt import hashpw, gensalt, checkpw
 DB_CONFIG = {
     "host": "localhost",
     "user": "root",
-    "password": "root123",
+    "password": "root",
     "database": "secure_chat"
 }
 
@@ -24,6 +24,30 @@ def get_all_users():
     cur.close()
     conn.close()
     return users
+
+def get_undelivered_messages(username):
+    """Получить все неотправленные сообщения для пользователя"""
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, sender, payload, ts 
+        FROM messages 
+        WHERE receiver=%s AND delivered=0
+        ORDER BY ts ASC
+    """, (username,))
+    messages = cur.fetchall()
+    cur.close()
+    conn.close()
+    return messages
+
+def mark_message_delivered(msg_id):
+    """Отметить сообщение как доставленное"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE messages SET delivered=1 WHERE id=%s", (msg_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # ----------------- SERVER -----------------
 clients = {}  # username -> writer
@@ -88,6 +112,32 @@ async def handle_client(reader, writer):
                     user = username
                     clients[user] = writer
                     print(f"[LOGIN] User '{user}' logged in from {addr}")
+                    
+                    # ОТПРАВКА НЕПРОЧИТАННЫХ СООБЩЕНИЙ
+                    undelivered = get_undelivered_messages(user)
+                    print(f"[INFO] User '{user}' has {len(undelivered)} undelivered messages")
+                    
+                    for msg_data in undelivered:
+                        try:
+                            payload = msg_data['payload']
+                            try:
+                                payload = json.loads(payload)
+                            except:
+                                pass
+                            
+                            await safe_write(writer, {
+                                "type": "msg",
+                                "from": msg_data['sender'],
+                                "payload": payload,
+                                "id": msg_data['id']
+                            })
+                            
+                            # Отмечаем как доставленное
+                            mark_message_delivered(msg_data['id'])
+                            print(f"[DELIVERED] Message {msg_data['id']} delivered to {user}")
+                        except Exception as e:
+                            print(f"[ERROR] Failed to deliver message {msg_data['id']}: {e}")
+                
                 cur.close()
                 conn.close()
 
@@ -107,31 +157,51 @@ async def handle_client(reader, writer):
                 
                 conn = get_db()
                 cur = conn.cursor()
+                
+                # Проверяем, онлайн ли получатель
+                is_online = to_user in clients
+                delivered_status = 1 if is_online else 0
+                
                 cur.execute("""
-                    INSERT INTO messages (sender, receiver, payload, ts) 
-                    VALUES (%s, %s, %s, NOW())
-                """, (user, to_user, payload_str))
+                    INSERT INTO messages (sender, receiver, payload, delivered, ts) 
+                    VALUES (%s, %s, %s, %s, NOW())
+                """, (user, to_user, payload_str, delivered_status))
                 conn.commit()
                 
                 new_msg_id = cur.lastrowid
                 cur.close()
                 conn.close()
 
-                # Отправляем получателю
-                if to_user in clients:
-                    await safe_write(clients[to_user], {
+                # Отправляем получателю если он онлайн
+                if is_online:
+                    success = await safe_write(clients[to_user], {
                         "type": "msg", 
                         "from": user, 
                         "payload": payload,
                         "id": new_msg_id
                     })
+                    
+                    if success:
+                        print(f"[DELIVERED] Message {new_msg_id} delivered to online user {to_user}")
+                    else:
+                        # Если не удалось доставить, отмечаем как недоставленное
+                        conn = get_db()
+                        cur = conn.cursor()
+                        cur.execute("UPDATE messages SET delivered=0 WHERE id=%s", (new_msg_id,))
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                        print(f"[QUEUED] Message {new_msg_id} queued for offline user {to_user}")
+                else:
+                    print(f"[QUEUED] Message {new_msg_id} queued for offline user {to_user}")
                 
                 # Отправляем подтверждение отправителю
                 await safe_write(writer, {
                     "type": "msg_sent",
                     "id": new_msg_id,
                     "to": to_user,
-                    "payload": payload
+                    "payload": payload,
+                    "delivered": is_online
                 })
 
             # ---------- GET HISTORY ----------
@@ -210,7 +280,7 @@ async def handle_client(reader, writer):
                 writer.close()
                 await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
-            pass  # Игнорируем ошибки при закрытии
+            pass
         except Exception as e:
             print(f"[CLOSE ERROR] {e}")
 
@@ -237,6 +307,7 @@ async def main():
     )
     print("=" * 50)
     print("Server running on port 9999 (Max packet: 10MB)")
+    print("Offline message delivery: ENABLED")
     print("=" * 50)
     async with server:
         await server.serve_forever()
