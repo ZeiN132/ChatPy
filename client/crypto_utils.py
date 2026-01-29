@@ -1,26 +1,64 @@
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import os
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-def generate_ephemeral():
-    private_key = x25519.X25519PrivateKey.generate()
-    public_key = private_key.public_key()
-    return private_key, public_key
+def derive_shared_key(user1, user2):
+    """
+    Генерирует детерминированный общий ключ для двух пользователей.
+    Ключ будет одинаковым независимо от порядка пользователей.
+    """
+    # Сортируем имена для детерминированности
+    users = sorted([user1, user2])
+    # Создаем строку для хеширования
+    key_material = f"{users[0]}:{users[1]}:secret_salt_12345".encode()
+    # Используем SHA-256 для получения 32-байтного ключа
+    return hashlib.sha256(key_material).digest()
 
-def derive_shared_key(private_key, peer_pub_bytes):
-    peer_pub = x25519.X25519PublicKey.from_public_bytes(peer_pub_bytes)
-    shared = private_key.exchange(peer_pub)
-    key = HKDF(hashes.SHA256(),32,None,b"secure-chat").derive(shared)
-    return key
+def encrypt_msg(key, plaintext):
+    """
+    Шифрует сообщение с использованием ChaCha20-Poly1305.
+    
+    Args:
+        key: 32-байтный ключ шифрования
+        plaintext: bytes или str для шифрования
+    
+    Returns:
+        dict с nonce и ciphertext (в base64 для JSON)
+    """
+    import base64
+    
+    if isinstance(plaintext, str):
+        plaintext = plaintext.encode('utf-8')
+    
+    cipher = ChaCha20Poly1305(key)
+    nonce = os.urandom(12)  # ChaCha20Poly1305 использует 12-байтный nonce
+    ciphertext = cipher.encrypt(nonce, plaintext, None)
+    
+    return {
+        "nonce": base64.b64encode(nonce).decode('utf-8'),
+        "ciphertext": base64.b64encode(ciphertext).decode('utf-8')
+    }
 
-def encrypt_msg(key: bytes, plaintext: bytes):
-    aes = AESGCM(key)
-    nonce = os.urandom(12)
-    ct = aes.encrypt(nonce, plaintext, None)
-    return {"nonce":nonce.hex(),"ciphertext":ct.hex()}
-
-def decrypt_msg(key: bytes, data: dict):
-    aes = AESGCM(key)
-    return aes.decrypt(bytes.fromhex(data["nonce"]), bytes.fromhex(data["ciphertext"]), None)
+def decrypt_msg(key, encrypted_data):
+    """
+    Расшифровывает сообщение.
+    
+    Args:
+        key: 32-байтный ключ шифрования
+        encrypted_data: dict с nonce и ciphertext (в base64)
+    
+    Returns:
+        bytes расшифрованных данных
+    """
+    import base64
+    
+    if not isinstance(encrypted_data, dict):
+        raise ValueError("encrypted_data должен быть словарем с 'nonce' и 'ciphertext'")
+    
+    nonce = base64.b64decode(encrypted_data['nonce'])
+    ciphertext = base64.b64decode(encrypted_data['ciphertext'])
+    
+    cipher = ChaCha20Poly1305(key)
+    plaintext = cipher.decrypt(nonce, ciphertext, None)
+    
+    return plaintext

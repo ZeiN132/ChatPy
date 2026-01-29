@@ -14,9 +14,8 @@ from .crypto_utils import encrypt_msg, decrypt_msg
 from .forensic_protection import get_forensic_protection, get_secure_storage
 from .plausible_deniability import get_plausible_deniability
 
+# ---------- SMOOTH OVERLAY ----------
 class OverlayWidget(QWidget):
-    clicked = pyqtSignal()
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
@@ -30,10 +29,6 @@ class OverlayWidget(QWidget):
     def opacity(self, value):
         self._opacity = value
         self.update()
-
-    def mousePressEvent(self, event):
-        self.clicked.emit()
-        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -58,6 +53,7 @@ class OverlayWidget(QWidget):
         self.ani.finished.connect(self.hide)
         self.ani.start()
 
+# ---------- SIDEBAR PANEL ----------
 class SidebarPanel(QFrame):
     def __init__(self, parent):
         super().__init__(parent)
@@ -69,15 +65,17 @@ class SidebarPanel(QFrame):
             }
         """)
         self.is_open = False
-
+        # Изначально скрываем за пределами экрана
         self.setGeometry(-350, 0, 350, parent.height())
-
+        
     def slide_in(self):
+        """Плавное появление панели"""
         self.show()
         self.raise_()
-
+        
+        # Обновляем высоту под текущий размер окна
         parent_height = self.parent().height()
-
+        
         self.ani = QPropertyAnimation(self, b"geometry")
         self.ani.setDuration(300)
         self.ani.setStartValue(QRect(-350, 0, 350, parent_height))
@@ -85,10 +83,11 @@ class SidebarPanel(QFrame):
         self.ani.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.ani.start()
         self.is_open = True
-
+        
     def slide_out(self):
+        """Плавное скрытие панели"""
         parent_height = self.parent().height()
-
+        
         self.ani = QPropertyAnimation(self, b"geometry")
         self.ani.setDuration(250)
         self.ani.setStartValue(QRect(0, 0, 350, parent_height))
@@ -98,6 +97,7 @@ class SidebarPanel(QFrame):
         self.ani.start()
         self.is_open = False
 
+# ---------- PLAUSIBLE DENIABILITY DIALOG ----------
 class PlausibleDeniabilityDialog(QFrame):
     def __init__(self, parent, on_confirm, on_cancel):
         super().__init__(parent)
@@ -111,10 +111,12 @@ class PlausibleDeniabilityDialog(QFrame):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
+        # Заголовок
         title = QLabel("Plausible Deniability")
         title.setStyleSheet("font-size: 18px; font-weight: bold; border: none; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
+        # Описание
         description = QLabel(
             "Set up a decoy password for plausible deniability.\n\n"
             "When you log in with this password, you'll see\n"
@@ -123,20 +125,22 @@ class PlausibleDeniabilityDialog(QFrame):
         description.setStyleSheet("font-size: 13px; border: none; background: transparent; color: #cccccc;")
         description.setWordWrap(True)
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
+        # Поле ввода пароля
         self.password_input = QLineEdit()
         self.password_input.setPlaceholderText("Enter decoy password...")
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-
+        
+        # Кнопки
         btn_layout = QHBoxLayout()
         self.confirm_btn = QPushButton("SET DECOY PASSWORD")
         self.confirm_btn.setObjectName("success")
         self.cancel_btn = QPushButton("CANCEL")
         self.cancel_btn.setObjectName("secondary")
-
+        
         btn_layout.addWidget(self.confirm_btn)
         btn_layout.addWidget(self.cancel_btn)
-
+        
         layout.addWidget(title)
         layout.addWidget(description)
         layout.addWidget(self.password_input)
@@ -156,34 +160,38 @@ class PlausibleDeniabilityDialog(QFrame):
     def cancel(self):
         self.on_cancel()
         self.close_dialog()
-
+    
     def close_dialog(self):
         self.parent().fade_out()
         self.deleteLater()
 
+# ---------- SETTINGS PANEL ----------
 class SettingsPanel(QWidget):
     def __init__(self, parent, chat_window):
         super().__init__(parent)
         self.chat_window = chat_window
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(20)
-
+        
+        # Заголовок
         header = QLabel("Settings")
         header.setStyleSheet("font-size: 20px; font-weight: bold;")
-
+        
+        # Разделитель
         line1 = QFrame()
         line1.setFrameShape(QFrame.Shape.HLine)
         line1.setStyleSheet("background-color: #333333;")
-
+        
+        # Enable Secure Mode (глобальная настройка)
         secure_section = QWidget()
         secure_layout = QVBoxLayout(secure_section)
         secure_layout.setSpacing(10)
-
+        
         secure_title = QLabel("Secure Mode")
         secure_title.setStyleSheet("font-size: 16px; font-weight: bold;")
-
+        
         secure_desc = QLabel(
             "Enable forensic protection:\n"
             "• Memory wiping after closing chats\n"
@@ -191,112 +199,95 @@ class SettingsPanel(QWidget):
             "• Anti-recovery measures"
         )
         secure_desc.setStyleSheet("font-size: 12px; color: #888888;")
-
+        
         self.secure_toggle = QPushButton("Enable Secure Mode")
         self.secure_toggle.setObjectName("secondary")
         self.secure_toggle.setCheckable(True)
         self.secure_toggle.clicked.connect(self.toggle_secure_mode)
-
+        
         secure_layout.addWidget(secure_title)
         secure_layout.addWidget(secure_desc)
         secure_layout.addWidget(self.secure_toggle)
-
+        
+        # Разделитель
         line2 = QFrame()
         line2.setFrameShape(QFrame.Shape.HLine)
         line2.setStyleSheet("background-color: #333333;")
-
+        
+        # Plausible Deniability
         plausible_section = QWidget()
         plausible_layout = QVBoxLayout(plausible_section)
         plausible_layout.setSpacing(10)
-
+        
         plausible_title = QLabel("Plausible Deniability")
         plausible_title.setStyleSheet("font-size: 16px; font-weight: bold;")
-
+        
         plausible_desc = QLabel(
             "Create a decoy account with fake messages.\n"
             "Use a different password to access innocent chat."
         )
         plausible_desc.setStyleSheet("font-size: 12px; color: #888888;")
-
+        
         self.plausible_btn = QPushButton("Setup Decoy Password")
         self.plausible_btn.setObjectName("secondary")
         self.plausible_btn.clicked.connect(self.setup_plausible_deniability)
-
+        
         plausible_layout.addWidget(plausible_title)
         plausible_layout.addWidget(plausible_desc)
         plausible_layout.addWidget(self.plausible_btn)
-
+        
+        # Собираем все вместе
         layout.addWidget(header)
         layout.addWidget(line1)
         layout.addWidget(secure_section)
         layout.addWidget(line2)
         layout.addWidget(plausible_section)
-        files_btn = QPushButton("My Files")
-        files_btn.setObjectName("secondary")
-        files_btn.clicked.connect(self.open_files)
-
-        layout.addWidget(files_btn)
         layout.addStretch()
-
+        
+        # Обновляем UI
         self.update_secure_toggle()
-
+    
     def update_secure_toggle(self):
-        active = self.chat_window.is_secure_session_active()
-        self.secure_toggle.setChecked(active)
-        self.secure_toggle.setText(
-            "Secure Session Enabled" if active else "Enable Secure Session"
-        )
-
+        forensic = get_forensic_protection()
+        if forensic.is_secure_mode():
+            self.secure_toggle.setText("Secure Mode ON")
+            self.secure_toggle.setObjectName("success")
+            self.secure_toggle.setChecked(True)
+        else:
+            self.secure_toggle.setText("Secure Mode OFF")
+            self.secure_toggle.setObjectName("secondary")
+            self.secure_toggle.setChecked(False)
+        self.secure_toggle.setStyle(self.secure_toggle.style())
+    
     def toggle_secure_mode(self):
-        chat = self.chat_window
-
-        if not chat.peer:
-            QMessageBox.warning(
-                self,
-                "No contact selected",
-                "Select a contact before enabling secure session"
-            )
-            self.update_secure_toggle()
-            return
-
-        # --- если secure session уже активна ---
-        if chat.is_secure_session_active():
-            reply = QMessageBox.question(
-                self,
-                "Disable secure session",
-                "Disable secure session for both users?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                chat.disable_secure_session()
-            else:
-                self.update_secure_toggle()
-            return
-
-        # --- если secure session НЕ активна ---
-        chat.request_secure_session()
+        forensic = get_forensic_protection()
+        
+        if forensic.is_secure_mode():
+            # Выключаем
+            forensic.disable_secure_mode()
+        else:
+            # Включаем
+            forensic.enable_secure_mode()        
         self.update_secure_toggle()
-
-
+    
     def setup_plausible_deniability(self):
         self.chat_window.show_plausible_deniability_dialog()
 
-    def open_files(self):
-        if hasattr(self.chat_window, "switch_sidebar_tab"):
-            self.chat_window.switch_sidebar_tab(0)
-
+# ---------- FILES PANEL ----------
 class FilesPanel(QWidget):
     def __init__(self, parent, dropbox_mgr):
         super().__init__(parent)
         self.dropbox_mgr = dropbox_mgr
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
-
+        
+        # Заголовок
         header = QLabel("My Files")
         header.setStyleSheet("font-size: 20px; font-weight: bold;")
-
+        
+        # Статус подключения
         status_layout = QHBoxLayout()
         self.status_label = QLabel()
         self.status_label.setObjectName("statusLabel")
@@ -304,43 +295,46 @@ class FilesPanel(QWidget):
         self.disconnect_btn = QPushButton("Disconnect")
         self.disconnect_btn.setObjectName("danger")
         self.disconnect_btn.hide()
-
+        
         status_layout.addWidget(self.status_label)
         status_layout.addStretch()
         status_layout.addWidget(self.connect_btn)
         status_layout.addWidget(self.disconnect_btn)
-
+        
+        # Информация об аккаунте
         self.account_info = QLabel()
         self.account_info.setObjectName("infoLabel")
         self.account_info.hide()
-
+        
+        # Область прокрутки для файлов
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setStyleSheet("QScrollArea { border: none; }")
-
+        
         self.files_container = QWidget()
         self.files_layout = QGridLayout(self.files_container)
         self.files_layout.setSpacing(15)
         self.files_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-
+        
         scroll_area.setWidget(self.files_container)
-
+        
+        # Кнопка обновления
         self.refresh_btn = QPushButton("Refresh Files")
         self.refresh_btn.setObjectName("secondary")
         self.refresh_btn.setEnabled(False)
-
+        
         layout.addWidget(header)
         layout.addLayout(status_layout)
         layout.addWidget(self.account_info)
         layout.addWidget(scroll_area)
         layout.addWidget(self.refresh_btn)
-
+        
         self.connect_btn.clicked.connect(self.connect_dropbox)
         self.disconnect_btn.clicked.connect(self.disconnect_dropbox)
         self.refresh_btn.clicked.connect(self.refresh_files)
-
+        
         self.update_status()
-
+    
     def update_status(self):
         if self.dropbox_mgr.is_authenticated():
             self.status_label.setText("Connected")
@@ -348,7 +342,7 @@ class FilesPanel(QWidget):
             self.connect_btn.hide()
             self.disconnect_btn.show()
             self.refresh_btn.setEnabled(True)
-
+            
             account = self.dropbox_mgr.get_account_info()
             if account:
                 used_mb = account['used_space'] / (1024 * 1024)
@@ -358,7 +352,7 @@ class FilesPanel(QWidget):
                     f"Space: {used_mb:.1f} MB / {total_mb:.1f} MB"
                 )
                 self.account_info.show()
-
+            
             self.refresh_files()
         else:
             self.status_label.setText("Not connected")
@@ -368,26 +362,26 @@ class FilesPanel(QWidget):
             self.refresh_btn.setEnabled(False)
             self.account_info.hide()
             self.clear_files()
-
+    
     def connect_dropbox(self):
         try:
             auth_url = self.dropbox_mgr.start_auth_flow()
             dialog = DropboxAuthDialog(self, auth_url)
-
-            if dialog.show() == QDialog.DialogCode.Accepted:
+            
+            if dialog.exec() == QDialog.DialogCode.Accepted:
                 code = dialog.get_code()
                 if code:
                     success, message = self.dropbox_mgr.finish_auth_flow(code)
-
+                    
                     if success:
                         QMessageBox.information(self, "Success", message)
                         self.update_status()
                     else:
                         QMessageBox.warning(self, "Error", message)
-
+        
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Authorization failed: {str(e)}")
-
+    
     def disconnect_dropbox(self):
         reply = QMessageBox.question(
             self, 
@@ -396,52 +390,52 @@ class FilesPanel(QWidget):
             "You will need to re-authorize to access your files.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
+        
         if reply == QMessageBox.StandardButton.Yes:
             self.dropbox_mgr.disconnect()
             self.update_status()
-
+    
     def clear_files(self):
         while self.files_layout.count():
             item = self.files_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-
+    
     def refresh_files(self):
         if not self.dropbox_mgr.is_authenticated():
             return
-
+        
         self.clear_files()
         files = self.dropbox_mgr.list_files()
-
+        
         for idx, file_info in enumerate(files):
             row = idx // 2
             col = idx % 2
-
+            
             card = FileCardWidget(file_info, self.download_file, self.delete_file)
             self.files_layout.addWidget(card, row, col)
-
+    
     def download_file(self, file_info):
         try:
             success, data, message = self.dropbox_mgr.download_file(file_info['path'])
-
+            
             if success:
                 save_path, _ = QFileDialog.getSaveFileName(
                     self,
                     "Save File",
                     file_info['name']
                 )
-
+                
                 if save_path:
                     with open(save_path, 'wb') as f:
                         f.write(data)
                     QMessageBox.information(self, "Success", "File downloaded and decrypted successfully!")
             else:
                 QMessageBox.warning(self, "Error", f"Download failed: {message}")
-
+        
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Download error: {str(e)}")
-
+    
     def delete_file(self, file_info):
         reply = QMessageBox.question(
             self,
@@ -450,127 +444,130 @@ class FilesPanel(QWidget):
             "This action cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
+        
         if reply == QMessageBox.StandardButton.Yes:
             success, message = self.dropbox_mgr.delete_file(file_info['path'])
-
+            
             if success:
                 QMessageBox.information(self, "Success", "File deleted successfully!")
                 self.refresh_files()
             else:
                 QMessageBox.warning(self, "Error", f"Delete failed: {message}")
 
+# ---------- FILE CARD WIDGET ----------
 class FileCardWidget(QWidget):
     def __init__(self, file_info, on_download, on_delete):
         super().__init__()
         self.file_info = file_info
         self.on_download = on_download
         self.on_delete = on_delete
-
+        
         self.setFixedSize(150, 180)
         self.setStyleSheet("""
             FileCardWidget {
                 background-color: #2b2b2b;
                 border-radius: 8px;
-                border: 1px solid 
-
+                border: 1px solid #333333;
             }
             FileCardWidget:hover {
                 background-color: #333333;
             }
         """)
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
-
+        
         icon_label = QLabel("📄")
         icon_label.setStyleSheet("font-size: 48px; border: none; background: transparent;")
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         name_label = QLabel(file_info['name'])
         name_label.setObjectName("fileNameLabel")
         name_label.setWordWrap(True)
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name_label.setMaximumHeight(40)
-
+        
         size_kb = file_info['size'] / 1024
         size_label = QLabel(f"{size_kb:.1f} KB")
         size_label.setObjectName("infoLabel")
         size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(5)
-
+        
         self.download_btn = QPushButton("⬇")
         self.download_btn.setObjectName("icon")
         self.download_btn.setFixedSize(30, 30)
         self.download_btn.setToolTip("Download")
-
+        
         self.delete_btn = QPushButton("🗑")
         self.delete_btn.setObjectName("icon")
         self.delete_btn.setFixedSize(30, 30)
         self.delete_btn.setToolTip("Delete")
-
+        
         if not file_info['has_key']:
             self.download_btn.setEnabled(False)
             self.download_btn.setToolTip("You don't have the decryption key")
-
+        
         btn_layout.addWidget(self.download_btn)
         btn_layout.addWidget(self.delete_btn)
-
+        
         layout.addWidget(icon_label)
         layout.addWidget(name_label)
         layout.addWidget(size_label)
         layout.addStretch()
         layout.addLayout(btn_layout)
-
+        
         self.download_btn.clicked.connect(lambda: self.on_download(self.file_info))
         self.delete_btn.clicked.connect(lambda: self.on_delete(self.file_info))
 
+# ---------- DROPBOX AUTH DIALOG ----------
 class DropboxAuthDialog(QDialog):
     def __init__(self, parent, auth_url):
         super().__init__(parent)
         self.setWindowTitle("Dropbox Authorization")
         self.setFixedSize(450, 200)
         self.setModal(True)
-
+        
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
-
+        
         info = QLabel("A browser window has been opened for Dropbox authorization.\n"  "After authorizing, copy the code and paste it below:")
         info.setWordWrap(True)
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         self.code_input = QLineEdit()
         self.code_input.setPlaceholderText("Paste authorization code here...")
-
+        
         btn_layout = QHBoxLayout()
         self.ok_btn = QPushButton("Authorize")
         self.ok_btn.setObjectName("success")
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("secondary")
-
+        
         btn_layout.addWidget(self.ok_btn)
         btn_layout.addWidget(self.cancel_btn)
-
+        
         layout.addWidget(info)
         layout.addWidget(self.code_input)
         layout.addLayout(btn_layout)
-
+        
         self.ok_btn.clicked.connect(self.accept)
         self.cancel_btn.clicked.connect(self.reject)
         self.code_input.returnPressed.connect(self.accept)
-
+    
     def get_code(self):
         return self.code_input.text().strip()
 
+# ---------- SECURE SESSION CONFIRMATION DIALOG ----------
 class SecureSessionDialog(QFrame):
-    def __init__(self, peer, on_accept, parent=None):
+    def __init__(self, parent, peer, on_accept, on_reject):
         super().__init__(parent)
         self.setObjectName("ConfirmDialog")
         self.setFixedSize(400, 250)
         self.on_accept = on_accept
+        self.on_reject = on_reject
         self.peer = peer
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
 
@@ -581,7 +578,7 @@ class SecureSessionDialog(QFrame):
         title = QLabel("🔒 Secure Session Request")
         title.setStyleSheet("font-size: 18px; font-weight: bold; border: none; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         message = QLabel(
             f"<b>{peer}</b> wants to start a secure session.\n\n"
             "If you accept:\n"
@@ -592,16 +589,16 @@ class SecureSessionDialog(QFrame):
         message.setStyleSheet("font-size: 13px; border: none; background: transparent;")
         message.setWordWrap(True)
         message.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         btn_layout = QHBoxLayout()
         self.accept_btn = QPushButton("ACCEPT")
         self.accept_btn.setObjectName("success")
         self.reject_btn = QPushButton("DECLINE")
         self.reject_btn.setObjectName("danger")
-
+        
         btn_layout.addWidget(self.accept_btn)
         btn_layout.addWidget(self.reject_btn)
-
+        
         layout.addWidget(title)
         layout.addWidget(message)
         layout.addStretch()
@@ -611,18 +608,18 @@ class SecureSessionDialog(QFrame):
         self.reject_btn.clicked.connect(self.reject)
 
     def accept(self):
-        if self.on_accept:
-            self.on_accept(self.peer)
-        self.accepted = True
+        self.on_accept(self.peer)
         self.close_dialog()
 
     def reject(self):
-        self.accepted = False
+        self.on_reject(self.peer)
         self.close_dialog()
-
+    
     def close_dialog(self):
-        self.close()
+        self.parent().fade_out()
+        self.deleteLater()
 
+# ---------- CONFIRMATION DIALOG ----------
 class CustomDeleteDialog(QFrame):
     def __init__(self, parent, msg_id, on_confirm):
         super().__init__(parent)
@@ -639,20 +636,20 @@ class CustomDeleteDialog(QFrame):
         label = QLabel("Delete message?")
         label.setStyleSheet("font-size: 18px; font-weight: bold; border: none; background: transparent;")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         self.checkbox = QCheckBox("Delete for everyone")
         self.checkbox.setChecked(True)
         self.checkbox.setStyleSheet("border: none; background: transparent; font-size: 13px;")
-
+        
         btn_lay = QHBoxLayout()
         self.yes_btn = QPushButton("DELETE")
         self.yes_btn.setObjectName("danger")
         self.no_btn = QPushButton("CANCEL")
         self.no_btn.setObjectName("secondary")
-
+        
         btn_lay.addWidget(self.yes_btn)
         btn_lay.addWidget(self.no_btn)
-
+        
         layout.addWidget(label)
         layout.addStretch()
         layout.addWidget(self.checkbox)
@@ -669,49 +666,7 @@ class CustomDeleteDialog(QFrame):
         self.on_confirm(self.msg_id, self.checkbox.isChecked())
         self.cancel()
 
-class CustomMessageDialog(QFrame):
-    def __init__(self, parent, title, text, buttons=("OK",), callback=None):
-        super().__init__(parent)
-
-        self.callback = callback
-
-        self.setObjectName("ConfirmDialog")
-        self.setFixedSize(420, 220)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20,20,20,20)
-        layout.setSpacing(15)
-
-        t = QLabel(title)
-        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        t.setStyleSheet("font-size:18px;font-weight:bold;background:transparent;")
-
-        msg = QLabel(text)
-        msg.setWordWrap(True)
-        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        btns = QHBoxLayout()
-
-        for b in buttons:
-            btn = QPushButton(b)
-            btn.setObjectName("success" if b.lower() in ("ok","yes","accept") else "secondary")
-            btn.clicked.connect(lambda _, x=b: self.finish(x))
-            btns.addWidget(btn)
-
-        layout.addWidget(t)
-        layout.addWidget(msg)
-        layout.addStretch()
-        layout.addLayout(btns)
-
-    def finish(self, result):
-        if self.callback:
-            self.callback(result)
-
-        self.parent().fade_out()
-        self.deleteLater()
-
-
+# ---------- LOGIN WINDOW ----------
 class LoginWindow(QWidget):
     def __init__(self, net):
         super().__init__()
@@ -751,24 +706,26 @@ class LoginWindow(QWidget):
     def handle_login(self):
         username = self.user.text().strip()
         password = self.passw.text()
-
+        
         if not username or not password:
             QMessageBox.warning(self, "Error", "Please enter username and password")
             return
-
+        
         print(f"[DEBUG] Attempting login for user: {username}")
-
+        
+        # Проверяем, является ли пароль фейковым
         is_decoy = self.plausible.is_decoy_password(username, password)
-
+        
         if is_decoy:
             print(f"[PLAUSIBLE] User {username} logging in with DECOY password")
-
+            # Отправляем специальный флаг на сервер
             self.net.login(username, password, is_decoy=True)
         else:
-
+            # Обычный вход
             print(f"[LOGIN] User {username} logging in with NORMAL password")
             self.net.login(username, password, is_decoy=False)
 
+# ---------- CHAT WINDOW ----------
 class Signals(QObject):
     auth = pyqtSignal(dict)
     users = pyqtSignal(list)
@@ -788,56 +745,64 @@ class ChatWindow(QWidget):
         self.dropbox_mgr = dropbox_mgr
         self.peer = None
         self.bubbles = {}
-
+        
+        # Защита от форензики
         self.forensic = get_forensic_protection()
         self.secure_storage = get_secure_storage()
         self.plausible = get_plausible_deniability()
-
+        
+        # Отслеживание защищённых сессий по собеседникам
         self.secure_sessions = {}
 
         self.setWindowTitle(f"User: {username}")
         self.resize(1200, 750)
         self.setMinimumSize(900, 600)
 
+        # Основной layout
         main_lay = QHBoxLayout(self)
         main_lay.setContentsMargins(0,0,0,0)
         main_lay.setSpacing(0)
 
+        # Левая панель с контактами
         left_panel = QWidget()
         left_panel.setMaximumWidth(300)
         left_lay = QVBoxLayout(left_panel)
         left_lay.setContentsMargins(10, 10, 10, 10)
-
+        
         self.user_list = QListWidget()
-
+        
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
-
+        
         self.refresh_btn = QPushButton("Refresh contacts")
         self.refresh_btn.setObjectName("secondary")
-
+        
+        # Кнопка меню (три полоски)
         self.menu_btn = QPushButton("☰")
         self.menu_btn.setObjectName("secondary")
         self.menu_btn.setFixedWidth(50)
         self.menu_btn.setToolTip("Menu")
         self.menu_btn.clicked.connect(self.toggle_sidebar)
-
+        
         btn_layout.addWidget(self.menu_btn, 0)
         btn_layout.addWidget(self.refresh_btn, 1)
-
+        
         left_lay.addWidget(self.user_list)
         left_lay.addLayout(btn_layout)
 
+        # Chat Area
         right_panel = QWidget()
         right_lay = QVBoxLayout(right_panel)
-
+        
+        # Заголовок чата с кнопкой защищённого режима
         header_layout = QHBoxLayout()
         self.chat_title = QLabel("Select a contact...")
         self.chat_title.setStyleSheet("font-weight: bold; color: #0078d4; font-size: 16px;")
-
+        
         header_layout.addWidget(self.chat_title)
         header_layout.addStretch()
-
+        
+        # Индикатор защищённого режима
         self.secure_indicator = QLabel()
         self.secure_indicator.setStyleSheet("""
             background-color: #2b2b2b;
@@ -847,13 +812,13 @@ class ChatWindow(QWidget):
             font-size: 12px;
         """)
         self.secure_indicator.hide()
-
+        
         self.chat_area = QVBoxLayout()
         self.chat_area.addStretch()
-
+        
         container = QWidget()
         container.setLayout(self.chat_area)
-
+        
         self.scroll = QScrollArea()
         self.scroll.setWidget(container)
         self.scroll.setWidgetResizable(True)
@@ -877,32 +842,61 @@ class ChatWindow(QWidget):
         main_lay.addWidget(left_panel, 1)
         main_lay.addWidget(right_panel, 3)
 
+        # Overlay для диалогов
         self.overlay = OverlayWidget(self)
         self.overlay.setGeometry(0, 0, self.width(), self.height())
-        self.overlay.clicked.connect(self.close_sidebar)
 
+        # Боковая панель (изначально скрыта)
         self.sidebar = SidebarPanel(self)
         self.sidebar.hide()
-
+        
+        # Стековый виджет для переключения между Files и Settings
+        self.sidebar_stack = QStackedWidget(self.sidebar)
+        
+        # Панель файлов
+        self.files_panel = FilesPanel(self.sidebar, self.dropbox_mgr)
+        
+        # Панель настроек
+        self.settings_panel = SettingsPanel(self.sidebar, self)
+        
+        self.sidebar_stack.addWidget(self.files_panel)
+        self.sidebar_stack.addWidget(self.settings_panel)
+        
+        # Layout для sidebar
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        self.settings_panel = SettingsPanel(self.sidebar, self)
-        sidebar_layout.addWidget(self.settings_panel)
+        
+        # Кнопки переключения
+        tabs_layout = QHBoxLayout()
+        tabs_layout.setSpacing(0)
+        tabs_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.files_tab_btn = QPushButton("Files")
+        self.files_tab_btn.setObjectName("tab")
+        self.files_tab_btn.setCheckable(True)
+        self.files_tab_btn.setChecked(True)
+        self.files_tab_btn.clicked.connect(lambda: self.switch_sidebar_tab(0))
+        
+        self.settings_tab_btn = QPushButton("Settings")
+        self.settings_tab_btn.setObjectName("tab")
+        self.settings_tab_btn.setCheckable(True)
+        self.settings_tab_btn.clicked.connect(lambda: self.switch_sidebar_tab(1))
+        
+        tabs_layout.addWidget(self.files_tab_btn)
+        tabs_layout.addWidget(self.settings_tab_btn)
+
+        sidebar_layout.addLayout(tabs_layout)
+        sidebar_layout.addWidget(self.sidebar_stack)
 
         self.refresh_btn.clicked.connect(lambda: self.net.send({"type": "get_users"}))
         self.user_list.itemClicked.connect(self.select_peer)
         self.send_btn.clicked.connect(self.send_msg)
         self.input.returnPressed.connect(self.send_msg)
 
-    def close_sidebar(self):
-        if self.sidebar.is_open:
-            self.overlay.fade_out()
-            self.sidebar.slide_out()
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.overlay.setGeometry(0, 0, self.width(), self.height())
-
+        # Обновляем высоту sidebar при изменении размера окна
         if self.sidebar.is_open:
             self.sidebar.setGeometry(0, 0, 350, self.height())
         else:
@@ -915,28 +909,19 @@ class ChatWindow(QWidget):
         else:
             self.overlay.fade_in()
             self.sidebar.slide_in()
-
+        
     def switch_sidebar_tab(self, index):
         self.sidebar_stack.setCurrentIndex(index)
-
+        
+        # Обновляем состояние кнопок
         self.files_tab_btn.setChecked(index == 0)
         self.settings_tab_btn.setChecked(index == 1)
 
-    def show_message(self, title, text, buttons=("OK",), cb=None):
-        self.overlay.fade_in()
-        dlg = CustomMessageDialog(self.overlay, title, text, buttons, cb)
-        dlg.move(
-            (self.width()-420)//2,
-            (self.height()-220)//2
-        )
-        dlg.show()
-
-
     def show_plausible_deniability_dialog(self):
         self.close_sidebar()
-
+        
         QTimer.singleShot(300, lambda: self._show_plausible_dialog())
-
+    
     def _show_plausible_dialog(self):
         self.overlay.fade_in()
         dialog = PlausibleDeniabilityDialog(
@@ -946,19 +931,19 @@ class ChatWindow(QWidget):
         )
         dialog.move((self.width() - 400) // 2, (self.height() - 250) // 2)
         dialog.show()
-
+    
     def on_plausible_confirm(self, decoy_password):
         if not decoy_password:
             QMessageBox.warning(self, "Error", "Decoy password cannot be empty!")
             return
-
+        
         try:
-
+            # Настраиваем фальшивый пароль
             decoy_username = self.plausible.setup_decoy_password(
                 self.username,
                 decoy_password
             )
-
+            
             QMessageBox.information(
                 self,
                 "Success",
@@ -969,8 +954,9 @@ class ChatWindow(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to setup decoy password: {str(e)}")
-
+    
     def on_plausible_cancel(self):
+        """Обработчик отмены настройки plausible deniability"""
         pass
 
     def is_secure_session_active(self):
@@ -981,10 +967,8 @@ class ChatWindow(QWidget):
     def toggle_secure_mode(self):
         if not self.peer:
             QMessageBox.warning(self, "No Contact", "Please select a contact first.")
-        else:
-            self.chat_window.toggle_secure_mode()
-            self.update_secure_toggle()
-
+            return
+        
         if self.is_secure_session_active():
             reply = QMessageBox.question(
                 self,
@@ -997,43 +981,37 @@ class ChatWindow(QWidget):
                 "Are you sure?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-
+            
             if reply == QMessageBox.StandardButton.Yes:
                 self.disable_secure_session()
         else:
             self.request_secure_session()
 
     def request_secure_session(self):
+        if not self.peer:
+            return
+        
         self.net.send({
             "type": "secure_session_request",
             "peer": self.peer
         })
-
-    def show_secure_session_request(self, peer):
-        if hasattr(self, "overlay"):
-            self.overlay.fade_in()
-
-        dialog = SecureSessionDialog(
-            peer=peer,
-            on_accept=self.accept_secure_session,
-            parent=self
+        
+        QMessageBox.information(
+            self,
+            "Request Sent",
+            f"Secure session request sent to {self.peer}.\nWaiting for response..."
         )
 
-        self._center_dialog(dialog)
-
-        result = dialog.show()
-
-        if hasattr(self, "overlay"):
-            self.overlay.fade_out()
-
-        if result == QDialog.rejected:
-            self.decline_secure_session(peer)
-
-    def _center_dialog(self, dialog):
-        screen = QApplication.primaryScreen().geometry()
-        dialog_rect = dialog.frameGeometry()
-        dialog_rect.moveCenter(screen.center())
-        dialog.move(dialog_rect.topLeft())
+    def show_secure_session_request(self, peer):
+        self.overlay.fade_in()
+        dialog = SecureSessionDialog(
+            self.overlay,
+            peer,
+            self.accept_secure_session,
+            self.reject_secure_session
+        )
+        dialog.move((self.width() - 400) // 2, (self.height() - 250) // 2)
+        dialog.show()
 
     def accept_secure_session(self, peer):
         self.net.send({
@@ -1105,8 +1083,26 @@ class ChatWindow(QWidget):
 
     def update_secure_ui(self):
         if self.is_secure_session_active():
+            self.secure_mode_toggle.setText("SECURE MODE")
+            self.secure_mode_toggle.setObjectName("success")
+            self.secure_mode_toggle.setStyle(self.secure_mode_toggle.style())
+            
+            self.secure_indicator.setText(
+                "SECURE SESSION ACTIVE - Messages will be erased FOR BOTH USERS after closing"
+            )
+            self.secure_indicator.setStyleSheet("""
+                background-color: #28a745;
+                color: white;
+                padding: 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                font-weight: bold;
+            """)
             self.secure_indicator.show()
         else:
+            self.secure_mode_toggle.setText("Normal Mode")
+            self.secure_mode_toggle.setObjectName("secondary")
+            self.secure_mode_toggle.setStyle(self.secure_mode_toggle.style())
             self.secure_indicator.hide()
 
     def select_peer(self, item):
@@ -1177,17 +1173,24 @@ class ChatWindow(QWidget):
                 "You need to connect to Dropbox first.\nWould you like to do it now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-
+            
             if reply == QMessageBox.StandardButton.Yes:
                 self.open_sidebar()
+                self.switch_sidebar_tab(0)
             return
-
+        
         try:
-
+            # progress = QMessageBox(self)
+            # progress.setWindowTitle("Uploading...")
+            # progress.setText(f"Uploading {filename} to Dropbox...")
+            # progress.setStandardButtons(QMessageBox.StandardButton.NoButton)
+            # progress.show()
             QApplication.processEvents()
-
+            
             success, path, key = self.dropbox_mgr.upload_file(filename, data)
-
+            
+            # progress.close()
+            
             if success:
                 QMessageBox.information(
                     self,
@@ -1197,7 +1200,7 @@ class ChatWindow(QWidget):
                 )
             else:
                 QMessageBox.warning(self, "Error", f"Upload failed: {path}")
-
+        
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Upload error: {str(e)}")
 
@@ -1209,7 +1212,7 @@ class ChatWindow(QWidget):
 
     def decrypt_payload(self, payload, peer):
         key = self.net.get_key(peer)
-
+        
         if isinstance(payload, dict) and 'nonce' in payload and 'ciphertext' in payload:
             try:
                 decrypted_bytes = decrypt_msg(key, payload)
@@ -1217,17 +1220,17 @@ class ChatWindow(QWidget):
             except Exception as e:
                 print(f"[DECRYPT ERROR] {e}")
                 return "Decrypt error"
-
+        
         elif isinstance(payload, str) and payload.startswith("FILE:"):
             return payload
-
+        
         else:
             return str(payload)
 
     def bubble(self, payload, mine, msg_id=None):
         widget = QWidget()
         row = QHBoxLayout(widget)
-
+        
         is_file = False
         file_name = None
         file_bytes = None
@@ -1236,20 +1239,20 @@ class ChatWindow(QWidget):
 
         if isinstance(payload, dict) and 'nonce' in payload and 'ciphertext' in payload:
             display_text = self.decrypt_payload(payload, self.peer)
-
+            
         elif isinstance(payload, str) and payload.startswith("FILE:"):
             try:
                 parts = payload.split(":", 2)
                 file_name = parts[1]
                 encrypted_data_json = parts[2]
-
+                
                 key = self.net.get_key(self.peer)
-
+                
                 if key:
                     encrypted_dict = json.loads(encrypted_data_json)
                     file_bytes = decrypt_msg(key, encrypted_dict)
                     is_file = True
-
+                    
                     if file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                         lbl = QLabel()
                         pix = QPixmap()
@@ -1271,16 +1274,16 @@ class ChatWindow(QWidget):
 
         lbl.setWordWrap(True)
         lbl.setMaximumWidth(500)
-
+        
         bubble_color = '#0078d4' if mine else '#2b2b2b'
-
+        
         lbl.setStyleSheet(f"""
             background-color: {bubble_color}; 
             color: white; 
             padding: 10px; 
             border-radius: 10px;
         """)
-
+        
         lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lbl.customContextMenuRequested.connect(
             lambda pos, mid=msg_id, fn=file_name, fb=file_bytes, is_f=is_file: 
@@ -1295,29 +1298,29 @@ class ChatWindow(QWidget):
             row.addStretch()
 
         self.chat_area.insertWidget(self.chat_area.count() - 1, widget)
-
+        
         if msg_id is not None:
             self.bubbles[msg_id] = widget
-
+            
             if self.is_secure_session_active():
                 self.secure_storage.add_message(self.peer, msg_id, {
                     'payload': payload,
                     'mine': mine
                 })
-
+        
         self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
 
     def show_context_menu(self, pos, target_widget, msg_id, is_file, filename, data):
         if is_file and (filename is None or data is None):
             return
-
+        
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { background-color: #242424; color: white; border: 1px solid #333; }")
-
+        
         save_act = None
         copy_act = None
         upload_act = None
-
+        
         if is_file:
             save_act = menu.addAction("Save file as...")
             upload_act = menu.addAction("Upload to Dropbox")
@@ -1326,9 +1329,9 @@ class ChatWindow(QWidget):
             copy_act = menu.addAction("Copy text")
 
         del_act = menu.addAction("Delete")
-
+        
         action = menu.exec(target_widget.mapToGlobal(pos))
-
+        
         if action is not None:
             if is_file and action is save_act:
                 self.save_file(filename, data)
@@ -1351,10 +1354,10 @@ class ChatWindow(QWidget):
         if msg_id in self.bubbles:
             self.bubbles[msg_id].deleteLater()
             del self.bubbles[msg_id]
-
+        
         if self.is_secure_session_active():
             self.secure_storage.remove_message(msg_id)
-
+        
         self.net.delete_message(msg_id, for_all)
 
     def send_msg(self):
@@ -1374,7 +1377,7 @@ class ChatWindow(QWidget):
                     txt, 
                     secure_mode=self.is_secure_session_active()
                 )
-
+            
             self.input.clear()
 
     def on_msg_sent(self, msg_id, to_user, payload):
@@ -1385,21 +1388,21 @@ class ChatWindow(QWidget):
         if msg_id in self.bubbles:
             self.bubbles[msg_id].deleteLater()
             del self.bubbles[msg_id]
-
+        
         if self.is_secure_session_active():
             self.secure_storage.remove_message(msg_id)
 
     def history(self, messages):
         if self.is_secure_session_active():
             return
-
+        
         self.clear_chat()
         for m in messages:
             self.bubble(m["payload"], m["sender"] == self.username, m["id"])
 
     def closeEvent(self, event):
         active_sessions = [peer for peer, active in self.secure_sessions.items() if active]
-
+        
         if active_sessions:
             reply = QMessageBox.question(
                 self,
@@ -1413,175 +1416,186 @@ class ChatWindow(QWidget):
                 f"This cannot be undone. Continue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-
+            
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
-
+            
             try:
                 for peer in active_sessions:
                     self.close_secure_chat(peer)
-
+                
                 self.secure_storage.secure_cleanup_all(self.forensic)
                 self.forensic.cleanup_temp_files()
                 self.forensic.secure_overwrite_ram(10)
-
+                
                 print("[SECURE] Application closed securely")
-
+                
             except Exception as e:
                 print(f"[ERROR] Error during secure cleanup: {e}")
-
+        
         event.accept()
 
+# ---------- EMPTY SETTINGS PANEL (для фейкового чата) ----------
 class EmptySettingsPanel(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(20)
-
+        
+        # Заголовок
         header = QLabel("⚙️ Settings")
         header.setStyleSheet("font-size: 20px; font-weight: bold;")
-
+        
+        # Разделитель
         line1 = QFrame()
         line1.setFrameShape(QFrame.Shape.HLine)
         line1.setStyleSheet("background-color: #333333;")
-
+        
+        # Пустое сообщение
         empty_label = QLabel("No settings available")
         empty_label.setStyleSheet("font-size: 14px; color: #888888;")
         empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         layout.addWidget(header)
         layout.addWidget(line1)
         layout.addStretch()
         layout.addWidget(empty_label)
         layout.addStretch()
 
+# ---------- FAKE FILES PANEL ----------
 class FakeFilesPanel(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
-
-        header = QLabel("My Files")
+        
+        # Заголовок
+        header = QLabel("📁 My Files")
         header.setStyleSheet("font-size: 20px; font-weight: bold;")
-
+        
+        # Статус подключения
         status_layout = QHBoxLayout()
         self.status_label = QLabel("Not connected")
         self.status_label.setObjectName("statusLabel")
         self.status_label.setStyleSheet("background-color: #bb2d3b; padding: 5px; border-radius: 4px;")
-
+        
         connect_btn = QPushButton("Connect Dropbox")
-        connect_btn.setEnabled(False)  
-
+        connect_btn.setEnabled(False)  # Неактивная кнопка
+        
         status_layout.addWidget(self.status_label)
         status_layout.addStretch()
         status_layout.addWidget(connect_btn)
-
+        
+        # Пустая область для файлов
         empty_label = QLabel("No files available")
         empty_label.setStyleSheet("font-size: 14px; color: #888888;")
         empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
+        
         layout.addWidget(header)
         layout.addLayout(status_layout)
         layout.addStretch()
         layout.addWidget(empty_label)
         layout.addStretch()
 
+# ---------- FAKE CHAT WINDOW ----------
 class FakeChatWindow(QWidget):
+    """
+    Фейковое окно чата с невинными сообщениями.
+    Полностью имитирует настоящий чат, но с фейковыми данными.
+    """
+    
     def __init__(self, net, username, dropbox_mgr):
         super().__init__()
-
-        self.net = net              # не используется, но нужен для совместимости
+        self.net = net
         self.username = username
         self.dropbox_mgr = dropbox_mgr
         self.peer = None
-        self.bubbles = {}
-
-        self.fake_data = self._load_fake_data()
-
+        self.plausible = get_plausible_deniability()
+        self.current_dialog = None
+        
         self.setWindowTitle(f"User: {username}")
         self.resize(1200, 750)
         self.setMinimumSize(900, 600)
 
-        # ================= MAIN LAYOUT =================
+        # Основной layout
         main_lay = QHBoxLayout(self)
-        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setContentsMargins(0,0,0,0)
         main_lay.setSpacing(0)
 
-        # ================= LEFT PANEL =================
+        # Левая панель с контактами
         left_panel = QWidget()
         left_panel.setMaximumWidth(300)
         left_lay = QVBoxLayout(left_panel)
         left_lay.setContentsMargins(10, 10, 10, 10)
-
+        
         self.user_list = QListWidget()
-        self.user_list.addItems(self.fake_data.keys())
-        self.user_list.itemClicked.connect(self.select_peer)
-
+        
+        # Заполняем фейковыми контактами
+        fake_contacts = self.plausible.get_fake_contacts()
+        for contact in fake_contacts:
+            self.user_list.addItem(contact)
+        
         btn_layout = QHBoxLayout()
-        self.refresh_btn = QPushButton("Refresh contacts")
-        self.refresh_btn.setObjectName("secondary")
-        self.refresh_btn.setEnabled(False)
-
+        btn_layout.setSpacing(10)
+        
+        # Кнопка меню (три полоски)
         self.menu_btn = QPushButton("☰")
         self.menu_btn.setObjectName("secondary")
         self.menu_btn.setFixedWidth(50)
+        self.menu_btn.setToolTip("Menu")
         self.menu_btn.clicked.connect(self.toggle_sidebar)
-
+        
+        refresh_btn = QPushButton("Refresh contacts")
+        refresh_btn.setObjectName("secondary")
+        refresh_btn.clicked.connect(self.refresh_contacts)
+        
         btn_layout.addWidget(self.menu_btn, 0)
-        btn_layout.addWidget(self.refresh_btn, 1)
-
+        btn_layout.addWidget(refresh_btn, 1)
+        
         left_lay.addWidget(self.user_list)
         left_lay.addLayout(btn_layout)
 
-        # ================= RIGHT PANEL =================
+        # Chat Area
         right_panel = QWidget()
         right_lay = QVBoxLayout(right_panel)
-
+        
+        # Заголовок чата
         header_layout = QHBoxLayout()
         self.chat_title = QLabel("Select a contact...")
-        self.chat_title.setStyleSheet(
-            "font-weight: bold; color: #0078d4; font-size: 16px;"
-        )
-
-        self.fake_mode_label = QLabel("DECOY MODE")
-        self.fake_mode_label.setStyleSheet("""
-            background-color: #6c757d;
-            color: white;
-            padding: 6px 10px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
-        """)
-
+        self.chat_title.setStyleSheet("font-weight: bold; color: #0078d4; font-size: 16px;")
         header_layout.addWidget(self.chat_title)
         header_layout.addStretch()
-        header_layout.addWidget(self.fake_mode_label)
-
+        
         self.chat_area = QVBoxLayout()
         self.chat_area.addStretch()
-
+        
         container = QWidget()
         container.setLayout(self.chat_area)
-
+        
         self.scroll = QScrollArea()
         self.scroll.setWidget(container)
         self.scroll.setWidgetResizable(True)
 
         input_lay = QHBoxLayout()
+        
+        # Кнопка файла (неактивная)
+        file_btn = QPushButton("📎")
+        file_btn.setFixedWidth(40)
+        file_btn.setEnabled(False)
+        
         self.input = QLineEdit()
         self.input.setPlaceholderText("Type a message...")
-        self.send_btn = QPushButton("Send")
-
-        self.send_btn.clicked.connect(self.send_fake_message)
-        self.input.returnPressed.connect(self.send_fake_message)
-
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self.fake_send)
+        
+        input_lay.addWidget(file_btn)
         input_lay.addWidget(self.input)
-        input_lay.addWidget(self.send_btn)
+        input_lay.addWidget(send_btn)
 
         right_lay.addLayout(header_layout)
         right_lay.addWidget(self.scroll)
@@ -1590,93 +1604,143 @@ class FakeChatWindow(QWidget):
         main_lay.addWidget(left_panel, 1)
         main_lay.addWidget(right_panel, 3)
 
-        # ================= SIDEBAR + OVERLAY =================
-        self.overlay = OverlayWidget(self)
+        # Overlay для диалогов
+        self.overlay = OverlayWidget(self, on_click=self.close_sidebar_and_dialogs)
         self.overlay.setGeometry(0, 0, self.width(), self.height())
-        self.overlay.clicked.connect(self.close_sidebar)
 
+        # Боковая панель (изначально скрыта)
         self.sidebar = SidebarPanel(self)
         self.sidebar.hide()
-
+        
+        # Стековый виджет для переключения между Files и Settings
+        self.sidebar_stack = QStackedWidget(self.sidebar)
+        
+        # Фейковая панель файлов
+        self.files_panel = FakeFilesPanel(self.sidebar)
+        
+        # Пустая панель настроек
+        self.settings_panel = EmptySettingsPanel(self.sidebar)
+        
+        self.sidebar_stack.addWidget(self.files_panel)
+        self.sidebar_stack.addWidget(self.settings_panel)
+        
+        # Layout для sidebar
         sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.sidebar_stack = QStackedWidget()
-        self.fake_files = FakeFilesPanel(self.sidebar)
-        self.fake_settings = EmptySettingsPanel(self.sidebar)
-
-        self.sidebar_stack.addWidget(self.fake_files)
-        self.sidebar_stack.addWidget(self.fake_settings)
-
-        # --- sidebar buttons ---
-        tabs = QWidget()
-        tabs_lay = QHBoxLayout(tabs)
-        tabs_lay.setContentsMargins(10, 10, 10, 10)
-
+        
+        # Кнопки переключения
+        tabs_layout = QHBoxLayout()
+        tabs_layout.setSpacing(0)
+        tabs_layout.setContentsMargins(0, 0, 0, 0)
+        
         self.files_tab_btn = QPushButton("Files")
+        self.files_tab_btn.setObjectName("tab")
         self.files_tab_btn.setCheckable(True)
-        self.settings_tab_btn = QPushButton("Settings")
-        self.settings_tab_btn.setCheckable(True)
-
-        self.files_tab_btn.clicked.connect(lambda: self.switch_sidebar_tab(0))
-        self.settings_tab_btn.clicked.connect(lambda: self.switch_sidebar_tab(1))
-
         self.files_tab_btn.setChecked(True)
+        self.files_tab_btn.clicked.connect(lambda: self.switch_sidebar_tab(0))
+        
+        self.settings_tab_btn = QPushButton("Settings")
+        self.settings_tab_btn.setObjectName("tab")
+        self.settings_tab_btn.setCheckable(True)
+        self.settings_tab_btn.clicked.connect(lambda: self.switch_sidebar_tab(1))
+        
+        tabs_layout.addWidget(self.files_tab_btn)
+        tabs_layout.addWidget(self.settings_tab_btn)
 
-        tabs_lay.addWidget(self.files_tab_btn)
-        tabs_lay.addWidget(self.settings_tab_btn)
-
-        sidebar_layout.addWidget(tabs)
+        sidebar_layout.addLayout(tabs_layout)
         sidebar_layout.addWidget(self.sidebar_stack)
 
-    # =======================================================
+        self.user_list.itemClicked.connect(self.select_peer)
+        self.input.returnPressed.connect(self.fake_send)
+        
+        # Предзагрузка первого контакта для реалистичности
+        QTimer.singleShot(100, self.preload_first_chat)
+    
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.overlay.setGeometry(0, 0, self.width(), self.height())
+        # Обновляем высоту sidebar при изменении размера окна
+        if self.sidebar.is_open:
+            self.sidebar.setGeometry(0, 0, 350, self.height())
+        else:
+            self.sidebar.setGeometry(-350, 0, 350, self.height())
 
-    def _load_fake_data(self):
-        return {
-            "Alice": [
-                {"text": "Hey! How are you?", "mine": False},
-                {"text": "All good 🙂", "mine": True},
-                {"text": "Coffee later?", "mine": False},
-            ],
-            "Bob": [
-                {"text": "Did you push the update?", "mine": False},
-                {"text": "Yep, everything works", "mine": True},
-            ],
-            "Mom": [
-                {"text": "Buy milk please", "mine": False},
-                {"text": "Sure ❤️", "mine": True},
-            ],
-        }
-
-    # ================= CHAT =================
-
+    def toggle_sidebar(self):
+        if self.sidebar.is_open:
+            self.overlay.fade_out()
+            self.sidebar.slide_out()
+        else:
+            self.overlay.fade_in()
+            self.sidebar.slide_in()
+    
+    def close_sidebar_and_dialogs(self):
+        """Закрыть sidebar и все диалоги при клике на затемнение"""
+        if self.sidebar.is_open:
+            self.overlay.fade_out()
+            self.sidebar.slide_out()
+        
+    def switch_sidebar_tab(self, index):
+        self.sidebar_stack.setCurrentIndex(index)
+        
+        # Обновляем состояние кнопок
+        self.files_tab_btn.setChecked(index == 0)
+        self.settings_tab_btn.setChecked(index == 1)
+    
+    def preload_first_chat(self):
+        """Предзагрузить первый чат для реалистичности"""
+        if self.user_list.count() > 0:
+            first_item = self.user_list.item(0)
+            self.select_peer(first_item)
+    
+    def refresh_contacts(self):
+        """Обновить список фейковых контактов"""
+        current_peer = self.peer
+        
+        self.user_list.clear()
+        fake_contacts = self.plausible.get_fake_contacts()
+        for contact in fake_contacts:
+            self.user_list.addItem(contact)
+        
+        # Восстанавливаем выбранный чат, если он был
+        if current_peer:
+            for i in range(self.user_list.count()):
+                if self.user_list.item(i).text() == current_peer:
+                    self.user_list.setCurrentRow(i)
+                    break
+    
     def select_peer(self, item):
+        """Выбрать собеседника"""
         self.peer = item.text()
         self.chat_title.setText(f"Chat with {self.peer}")
         self.clear_chat()
-
-        for msg in self.fake_data.get(self.peer, []):
-            self.bubble(msg["text"], msg["mine"])
-
+        
+        # Загружаем фейковые сообщения
+        fake_messages = self.plausible.get_fake_messages(self.peer)
+        for msg in fake_messages:
+            self.show_fake_message(msg['text'], msg['mine'])
+    
     def clear_chat(self):
+        """Очистить чат"""
         while self.chat_area.count() > 1:
-            item = self.chat_area.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-    def bubble(self, text, mine):
+            i = self.chat_area.takeAt(0)
+            if i.widget(): 
+                i.widget().deleteLater()
+    
+    def show_fake_message(self, text, mine):
+        """Показать фейковое сообщение"""
         widget = QWidget()
         row = QHBoxLayout(widget)
-
-        lbl = QLabel(text)
+        
+        lbl = QLabel(str(text))
         lbl.setWordWrap(True)
         lbl.setMaximumWidth(500)
-
-        color = "#0078d4" if mine else "#2b2b2b"
+        
+        bubble_color = '#0078d4' if mine else '#2b2b2b'
+        
         lbl.setStyleSheet(f"""
-            background-color: {color};
-            color: white;
-            padding: 10px;
+            background-color: {bubble_color}; 
+            color: white; 
+            padding: 10px; 
             border-radius: 10px;
         """)
 
@@ -1688,53 +1752,46 @@ class FakeChatWindow(QWidget):
             row.addStretch()
 
         self.chat_area.insertWidget(self.chat_area.count() - 1, widget)
-        self.scroll.verticalScrollBar().setValue(
-            self.scroll.verticalScrollBar().maximum()
-        )
+        self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
+    
+    def fake_send(self):
+        """Фейковая отправка сообщения (ничего не отправляется на сервер)"""
+        txt = self.input.text().strip()
+        if txt and self.peer:
+            # Просто показываем сообщение локально
+            self.show_fake_message(txt, True)
+            self.input.clear()
+            
+            # Через 1-3 секунды показываем автоответ
+            responses = [
+                "I see",
+                "Okay",
+                "Got it",
+                "Sure!",
+                "Alright",
+                "👍",
+                "Thanks!",
+                "Sounds good",
+                "No problem",
+                "Cool!",
+            ]
+            
+            QTimer.singleShot(
+                random.randint(1000, 3000), 
+                lambda: self.show_fake_message(random.choice(responses), False)
+            )
+    
+    def closeEvent(self, event):
+        """При закрытии просто выходим без сохранения"""
+        event.accept()
 
-    def send_fake_message(self):
-        text = self.input.text().strip()
-        if not text or not self.peer:
-            return
-
-        self.input.clear()
-        self.bubble(text, True)
-
-        self.fake_data[self.peer].append({
-            "text": text,
-            "mine": True
-        })
-
-    # ================= SIDEBAR =================
-
-    def toggle_sidebar(self):
-        if self.sidebar.is_open:
-            self.overlay.fade_out()
-            self.sidebar.slide_out()
-        else:
-            self.overlay.fade_in()
-            self.sidebar.slide_in()
-
-    def close_sidebar(self):
-        if self.sidebar.is_open:
-            self.overlay.fade_out()
-            self.sidebar.slide_out()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.overlay.setGeometry(0, 0, self.width(), self.height())
-
-    def switch_sidebar_tab(self, index):
-        self.sidebar_stack.setCurrentIndex(index)
-        self.files_tab_btn.setChecked(index == 0)
-        self.settings_tab_btn.setChecked(index == 1)
-
+# ---------- MAIN APP ----------
 class App:
     def __init__(self):
         self.app = QApplication(sys.argv)
         current_dir = os.path.dirname(os.path.abspath(__file__))
         style_path = os.path.join(current_dir, "styles.qss")
-
+        
         try:
             with open(style_path, "r", encoding="utf-8") as f:
                 style_content = f.read()
@@ -1743,9 +1800,9 @@ class App:
             print(f"Ошибка: Файл стилей не найден по пути {style_path}")
         except Exception as e:
             print(f"Ошибка при чтении стилей: {e}")
-
+        
         self.dropbox_mgr = DropboxManager()
-
+        
         self.signals = Signals()
         self.net = ClientNetwork(self.signals)
         self.net.connect()
@@ -1779,7 +1836,7 @@ class App:
                     peer, 
                     self.chat_win.forensic
                 )
-
+                
                 if self.chat_win.peer == peer:
                     self.chat_win.clear_chat()
                     QMessageBox.information(
@@ -1788,12 +1845,12 @@ class App:
                         f"🔒 {peer} closed the secure chat.\n"
                         f"All messages have been securely deleted."
                     )
-
+                
                 print(f"[SECURE] Messages with {peer} deleted on partner's request")
-
+                
             except Exception as e:
                 print(f"[ERROR] Failed to process secure chat closure: {e}")
-
+    
     def on_message(self, sender, payload, msg_id):
         if self.chat_win and sender == self.chat_win.peer:
             self.chat_win.bubble(payload, False, msg_id)
@@ -1801,9 +1858,9 @@ class App:
     def on_auth(self, data):
         if data.get("status") == "ok":
             is_decoy_mode = data.get("is_decoy", False)
-
+            
             if is_decoy_mode:
-
+                # Открываем фейковое окно чата
                 self.chat_win = FakeChatWindow(
                     self.net, 
                     data["username"], 
@@ -1811,13 +1868,13 @@ class App:
                 )
                 print(f"[PLAUSIBLE] Opened FAKE chat for {data['username']}")
             else:
-
+                # Обычное окно чата
                 self.chat_win = ChatWindow(
                     self.net, 
                     data["username"], 
                     self.dropbox_mgr
                 )
-
+            
             self.chat_win.show()
             self.login_win.close()
             self.net.send({"type": "get_users"})

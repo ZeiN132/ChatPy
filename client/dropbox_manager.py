@@ -17,8 +17,8 @@ class DropboxManager:
         
         # Вставьте сюда свои App Key и App Secret из Dropbox App Console
         # https://www.dropbox.com/developers/apps
-        self.APP_KEY = "MYAPIKEY"
-        self.APP_SECRET = "MYAPISECRET"
+        self.APP_KEY = "q1eo9hmk4bxbobj"
+        self.APP_SECRET = "t16n7v2x56z9op4"
         
         self.dbx = None
         self.file_keys = self._load_file_keys()
