@@ -9,7 +9,7 @@ class Client:
 
     async def connect(self):
         try:
-            self.reader, self.writer = await asyncio.open_connection("127.0.0.1", 9999)
+            self.reader, self.writer = await asyncio.open_connection("34.31.148.133", 9999)
             # Отправляем приветствие серверу
             self.send({"type": "hello", "user": self.username})
             return True

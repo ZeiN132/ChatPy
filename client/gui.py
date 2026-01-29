@@ -1853,7 +1853,7 @@ class LoginWindow(QWidget):
         lay.setContentsMargins(40, 30, 40, 30)
 
         title = QLabel("Chat")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #0078d4;")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.user = QLineEdit()

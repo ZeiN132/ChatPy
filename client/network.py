@@ -14,7 +14,7 @@ class ClientNetwork:
 
     def connect(self):
         try:
-            self.sock = socket.create_connection(("192.168.100.34", 9999))
+            self.sock = socket.create_connection(("34.31.148.133", 9999))
             self.file = self.sock.makefile("rwb")
             self.connected = True
             threading.Thread(target=self.reader, daemon=True).start()
