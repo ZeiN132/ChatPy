@@ -14,7 +14,7 @@ class ClientNetwork:
 
     def connect(self):
         try:
-            self.sock = socket.create_connection(("127.0.0.1", 9999))
+            self.sock = socket.create_connection(("192.168.100.34", 9999))
             self.file = self.sock.makefile("rwb")
             self.connected = True
             threading.Thread(target=self.reader, daemon=True).start()
@@ -46,11 +46,26 @@ class ClientNetwork:
             msg_type = msg.get("type")
             status = msg.get("status")
 
+            if msg_type == "password_reset":
+                self.signals.password_reset.emit(msg)
+                continue
+            if msg_type == "set_recovery_phrase":
+                self.signals.set_recovery_phrase.emit(msg)
+                continue
+            if msg_type == "register":
+                self.signals.register.emit(msg)
+                continue
+
             if status == "ok" or status == "error":
+                if msg.get("auth_stage") == "register":
+                    self.signals.register.emit(msg)
+                    continue
                 # Сохраняем имя пользователя при успешной авторизации
                 if status == "ok" and "username" in msg:
                     self.username = msg["username"]
                 self.signals.auth.emit(msg)
+                if "users" in msg:
+                    self.signals.users.emit(msg.get("users", []))
             
             elif msg_type == "all_users" or "users" in msg:
                 users_list = msg.get("users", [])
@@ -120,8 +135,13 @@ class ClientNetwork:
             print("[SEND ERROR]", e)
             self.connected = False
 
-    def register(self, username, password):
-        self.send({"type": "register", "username": username, "password": password})
+    def register(self, username, password, recovery_phrase):
+        self.send({
+            "type": "register",
+            "username": username,
+            "password": password,
+            "recovery_phrase": recovery_phrase
+        })
 
     def login(self, username, password, is_decoy=False):
         """
@@ -137,6 +157,21 @@ class ClientNetwork:
             "username": username, 
             "password": password,
             "is_decoy": is_decoy
+        })
+
+    def reset_password(self, username, recovery_phrase, new_password):
+        self.send({
+            "type": "reset_password",
+            "username": username,
+            "recovery_phrase": recovery_phrase,
+            "new_password": new_password
+        })
+
+    def set_recovery_phrase(self, username, recovery_phrase):
+        self.send({
+            "type": "set_recovery_phrase",
+            "username": username,
+            "recovery_phrase": recovery_phrase
         })
 
     def request_users(self):

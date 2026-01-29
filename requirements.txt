@@ -3,3 +3,4 @@ cryptography>=41.0.0
 mysql-connector-python>=8.0.33
 bcrypt>=4.0.1
 dropbox>=11.36.2
+keyring>=24.3.0

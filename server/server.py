@@ -1,5 +1,8 @@
 import asyncio
 import json
+import hashlib
+import secrets
+import time
 import mysql.connector
 from mysql.connector import Error
 from bcrypt import hashpw, gensalt, checkpw
@@ -12,10 +15,100 @@ DB_CONFIG = {
     "auth_plugin": "mysql_native_password"
 }
 
+RECOVERY_KDF_DEFAULTS = {
+    "kdf": "pbkdf2_sha256",
+    "iterations": 200000,
+    "dklen": 32
+}
+
+RESET_MAX_ATTEMPTS = 5
+RESET_LOCK_SECONDS = 60
+RESET_FAIL_DELAY = 1.5
+
+_reset_attempts = {}
+
 # ----------------- DB -----------------
 def get_db():
     conn = mysql.connector.connect(**DB_CONFIG)
     return conn
+
+def ensure_schema():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SHOW COLUMNS FROM users LIKE 'recovery_phrase_hash'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE users ADD COLUMN recovery_phrase_hash VARCHAR(128) NULL")
+    cur.execute("SHOW COLUMNS FROM users LIKE 'recovery_phrase_salt'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE users ADD COLUMN recovery_phrase_salt VARCHAR(64) NULL")
+    cur.execute("SHOW COLUMNS FROM users LIKE 'recovery_kdf_params'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE users ADD COLUMN recovery_kdf_params TEXT NULL")
+    cur.execute("SHOW COLUMNS FROM messages LIKE 'deleted_by_sender'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE messages ADD COLUMN deleted_by_sender TINYINT(1) DEFAULT 0")
+    cur.execute("SHOW COLUMNS FROM messages LIKE 'deleted_by_receiver'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE messages ADD COLUMN deleted_by_receiver TINYINT(1) DEFAULT 0")
+    cur.execute("SHOW COLUMNS FROM messages LIKE 'payload'")
+    row = cur.fetchone()
+    if row:
+        col_type = str(row[1]).lower()
+        # Ensure payload can store encrypted files and large JSON
+        if "text" not in col_type and "blob" not in col_type:
+            cur.execute("ALTER TABLE messages MODIFY payload MEDIUMTEXT")
+        elif col_type in ("tinytext",):
+            cur.execute("ALTER TABLE messages MODIFY payload MEDIUMTEXT")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def normalize_recovery_phrase(phrase):
+    return " ".join(phrase.lower().split())
+
+def is_valid_recovery_phrase(phrase):
+    parts = phrase.split(" ")
+    if len(parts) == 12 or len(parts) == 24:
+        return True
+    if len(parts) == 1 and len(parts[0]) == 24:
+        return True
+    return False
+
+def derive_recovery_hash(phrase, salt, kdf_params=None):
+    params = RECOVERY_KDF_DEFAULTS.copy()
+    if kdf_params:
+        params.update(kdf_params)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        phrase.encode("utf-8"),
+        salt,
+        int(params["iterations"]),
+        dklen=int(params["dklen"])
+    )
+    return dk.hex(), params
+
+def _reset_key(username, addr):
+    ip = addr[0] if addr else "unknown"
+    return f"{username}:{ip}"
+
+def check_reset_limit(key):
+    now = time.monotonic()
+    entry = _reset_attempts.get(key)
+    if entry and entry.get("lock_until", 0) > now:
+        return False, entry["lock_until"] - now
+    return True, 0
+
+def record_reset_failure(key):
+    now = time.monotonic()
+    entry = _reset_attempts.get(key, {"count": 0, "lock_until": 0})
+    entry["count"] += 1
+    if entry["count"] >= RESET_MAX_ATTEMPTS:
+        entry["lock_until"] = now + RESET_LOCK_SECONDS
+        entry["count"] = 0
+    _reset_attempts[key] = entry
+
+def clear_reset_failures(key):
+    _reset_attempts.pop(key, None)
 
 def get_all_users():
     conn = get_db()
@@ -33,7 +126,7 @@ def get_undelivered_messages(username):
     cur.execute("""
         SELECT id, sender, payload, ts, secure_mode 
         FROM messages 
-        WHERE receiver=%s AND delivered=0
+        WHERE receiver=%s AND delivered=0 AND deleted_by_receiver=0
         ORDER BY ts ASC
     """, (username,))
     messages = cur.fetchall()
@@ -57,7 +150,7 @@ def delete_secure_messages(sender, receiver):
     cur.execute("""
         DELETE FROM messages 
         WHERE secure_mode=1 
-        AND ((sender=%s AND receiver=%s) OR (sender=%s AND receiver=%s))
+        AND ((sender=%s AND receiver=%s AND deleted_by_sender=0) OR (sender=%s AND receiver=%s AND deleted_by_receiver=0))
     """, (sender, receiver, receiver, sender))
     deleted_count = cur.rowcount
     conn.commit()
@@ -100,16 +193,70 @@ async def handle_client(reader, writer):
             if mtype == "register":
                 username = msg["username"]
                 password = msg["password"].encode()
+                recovery_phrase = msg.get("recovery_phrase", "")
+                recovery_phrase = normalize_recovery_phrase(recovery_phrase)
+                has_recovery = bool(recovery_phrase)
+                if has_recovery and not is_valid_recovery_phrase(recovery_phrase):
+                    await safe_write(writer, {
+                        "type": "register",
+                        "status": "error",
+                        "error": "Recovery phrase must be 12/24 words or 24 characters",
+                        "auth_stage": "register"
+                    })
+                    continue
                 conn = get_db()
                 cur = conn.cursor()
                 cur.execute("SELECT username FROM users WHERE username=%s", (username,))
                 if cur.fetchone():
-                    await safe_write(writer, {"status": "error", "error": "User exists"})
+                    await safe_write(writer, {
+                        "type": "register",
+                        "status": "error",
+                        "error": "User exists",
+                        "auth_stage": "register"
+                    })
                 else:
                     pw_hash = hashpw(password, gensalt())
-                    cur.execute("INSERT INTO users(username,password_hash) VALUES(%s,%s)", (username, pw_hash))
+                    phrase_hash = None
+                    salt_hex = None
+                    kdf_params_json = None
+                    if has_recovery:
+                        salt = secrets.token_bytes(16)
+                        phrase_hash, kdf_params = derive_recovery_hash(recovery_phrase, salt)
+                        salt_hex = salt.hex()
+                        kdf_params_json = json.dumps(kdf_params)
+                    cur.execute(
+                        "INSERT INTO users(username,password_hash,recovery_phrase_hash,recovery_phrase_salt,recovery_kdf_params) "
+                        "VALUES(%s,%s,%s,%s,%s)",
+                        (
+                            username,
+                            pw_hash,
+                            phrase_hash,
+                            salt_hex,
+                            kdf_params_json
+                        )
+                    )
                     conn.commit()
-                    await safe_write(writer, {"status": "ok", "username": username, "users": get_all_users()})
+                    # Auto-login the user after successful registration so messaging works immediately.
+                    user = username
+                    clients[user] = writer
+                    reg_ok = await safe_write(writer, {
+                        "type": "register",
+                        "status": "ok",
+                        "username": username,
+                        "users": get_all_users(),
+                        "is_decoy": False,
+                        "recovery_set": bool(phrase_hash),
+                        "auth_stage": "register"
+                    })
+                    if reg_ok:
+                        await safe_write(writer, {
+                            "type": "auth",
+                            "status": "ok",
+                            "username": username,
+                            "users": get_all_users(),
+                            "is_decoy": False,
+                            "recovery_set": bool(phrase_hash)
+                        })
                 cur.close()
                 conn.close()
 
@@ -123,7 +270,7 @@ async def handle_client(reader, writer):
                 
                 conn = get_db()
                 cur = conn.cursor(dictionary=True)
-                cur.execute("SELECT password_hash FROM users WHERE username=%s", (username,))
+                cur.execute("SELECT password_hash, recovery_phrase_hash FROM users WHERE username=%s", (username,))
                 row = cur.fetchone()
                 
                 if not row:
@@ -159,7 +306,8 @@ async def handle_client(reader, writer):
                         "status": "ok", 
                         "username": username, 
                         "users": get_all_users(),
-                        "is_decoy": False
+                        "is_decoy": False,
+                        "recovery_set": bool(row.get("recovery_phrase_hash"))
                     })
                     user = username
                     clients[user] = writer
@@ -195,6 +343,153 @@ async def handle_client(reader, writer):
                     
                     cur.close()
                     conn.close()
+
+            # ---------- RESET PASSWORD ----------
+            elif mtype == "reset_password":
+                username = msg.get("username", "")
+                new_password = msg.get("new_password", "").encode()
+                recovery_phrase = normalize_recovery_phrase(msg.get("recovery_phrase", ""))
+
+                key = _reset_key(username, addr)
+                allowed, retry_after = check_reset_limit(key)
+                if not allowed:
+                    await safe_write(writer, {
+                        "type": "password_reset",
+                        "status": "error",
+                        "error": f"Too many attempts. Try again in {int(retry_after)}s."
+                    })
+                    continue
+
+                if not username or not recovery_phrase or not is_valid_recovery_phrase(recovery_phrase) or not new_password:
+                    await safe_write(writer, {
+                        "type": "password_reset",
+                        "status": "error",
+                        "error": "Invalid recovery phrase"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    "SELECT recovery_phrase_hash, recovery_phrase_salt, recovery_kdf_params "
+                    "FROM users WHERE username=%s",
+                    (username,)
+                )
+                row = cur.fetchone()
+
+                if not row or not row.get("recovery_phrase_hash"):
+                    record_reset_failure(key)
+                    await asyncio.sleep(RESET_FAIL_DELAY)
+                    await safe_write(writer, {
+                        "type": "password_reset",
+                        "status": "error",
+                        "error": "Recovery phrase not set"
+                    })
+                    cur.close()
+                    conn.close()
+                    continue
+
+                try:
+                    kdf_params = json.loads(row.get("recovery_kdf_params") or "{}")
+                except Exception:
+                    kdf_params = {}
+
+                try:
+                    salt = bytes.fromhex(row.get("recovery_phrase_salt") or "")
+                except Exception:
+                    salt = b""
+
+                if not salt:
+                    record_reset_failure(key)
+                    await asyncio.sleep(RESET_FAIL_DELAY)
+                    await safe_write(writer, {
+                        "type": "password_reset",
+                        "status": "error",
+                        "error": "Recovery data invalid"
+                    })
+                    cur.close()
+                    conn.close()
+                    continue
+
+                candidate_hash, _ = derive_recovery_hash(recovery_phrase, salt, kdf_params)
+                if candidate_hash != row.get("recovery_phrase_hash"):
+                    record_reset_failure(key)
+                    await asyncio.sleep(RESET_FAIL_DELAY)
+                    await safe_write(writer, {
+                        "type": "password_reset",
+                        "status": "error",
+                        "error": "Invalid recovery phrase"
+                    })
+                    cur.close()
+                    conn.close()
+                    continue
+
+                pw_hash = hashpw(new_password, gensalt())
+                cur.execute("UPDATE users SET password_hash=%s WHERE username=%s", (pw_hash, username))
+                conn.commit()
+                clear_reset_failures(key)
+                await safe_write(writer, {
+                    "type": "password_reset",
+                    "status": "ok",
+                    "message": "Password updated"
+                })
+                cur.close()
+                conn.close()
+
+            # ---------- SET RECOVERY PHRASE ----------
+            elif mtype == "set_recovery_phrase":
+                username = msg.get("username", "")
+                recovery_phrase = normalize_recovery_phrase(msg.get("recovery_phrase", ""))
+
+                if not username or not is_valid_recovery_phrase(recovery_phrase):
+                    await safe_write(writer, {
+                        "type": "set_recovery_phrase",
+                        "status": "error",
+                        "error": "Recovery phrase must be 12/24 words or 24 characters"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    "SELECT recovery_phrase_hash FROM users WHERE username=%s",
+                    (username,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    await safe_write(writer, {
+                        "type": "set_recovery_phrase",
+                        "status": "error",
+                        "error": "User not found"
+                    })
+                    cur.close()
+                    conn.close()
+                    continue
+
+                if row.get("recovery_phrase_hash"):
+                    await safe_write(writer, {
+                        "type": "set_recovery_phrase",
+                        "status": "error",
+                        "error": "Recovery phrase already set"
+                    })
+                    cur.close()
+                    conn.close()
+                    continue
+
+                salt = secrets.token_bytes(16)
+                phrase_hash, kdf_params = derive_recovery_hash(recovery_phrase, salt)
+                cur.execute(
+                    "UPDATE users SET recovery_phrase_hash=%s, recovery_phrase_salt=%s, recovery_kdf_params=%s WHERE username=%s",
+                    (phrase_hash, salt.hex(), json.dumps(kdf_params), username)
+                )
+                conn.commit()
+                await safe_write(writer, {
+                    "type": "set_recovery_phrase",
+                    "status": "ok",
+                    "message": "Recovery phrase set"
+                })
+                cur.close()
+                conn.close()
 
             # ---------- GET USERS ----------
             elif mtype == "get_users" and user:
@@ -293,7 +588,7 @@ async def handle_client(reader, writer):
                         SELECT id, sender, payload, secure_mode
                         FROM messages
                         WHERE secure_mode=1 
-                        AND ((sender=%s AND receiver=%s) OR (sender=%s AND receiver=%s))
+                        AND ((sender=%s AND receiver=%s AND deleted_by_sender=0) OR (sender=%s AND receiver=%s AND deleted_by_receiver=0))
                         ORDER BY ts
                     """, (user, peer, peer, user))
                 else:
@@ -302,7 +597,7 @@ async def handle_client(reader, writer):
                         SELECT id, sender, payload, secure_mode
                         FROM messages
                         WHERE secure_mode=0 
-                        AND ((sender=%s AND receiver=%s) OR (sender=%s AND receiver=%s))
+                        AND ((sender=%s AND receiver=%s AND deleted_by_sender=0) OR (sender=%s AND receiver=%s AND deleted_by_receiver=0))
                         ORDER BY ts
                     """, (user, peer, peer, user))
                 
@@ -334,17 +629,24 @@ async def handle_client(reader, writer):
                             sender, receiver = row['sender'], row['receiver']
                             
                             if sender == user or receiver == user:
-                                cur.execute("DELETE FROM messages WHERE id=%s", (msg_id,))
-                                conn.commit()
-                                print(f"[INFO] Message {msg_id} deleted by {user}")
+                                if for_all:
+                                    cur.execute("DELETE FROM messages WHERE id=%s", (msg_id,))
+                                    conn.commit()
+                                    print(f"[INFO] Message {msg_id} deleted for all by {user}")
 
-                                if for_all and sender == user:
-                                    peer = receiver
+                                    peer = receiver if sender == user else sender
                                     if peer in clients:
                                         await safe_write(clients[peer], {
-                                            "type": "delete_msg", 
+                                            "type": "delete_msg",
                                             "id": msg_id
                                         })
+                                else:
+                                    if sender == user:
+                                        cur.execute("UPDATE messages SET deleted_by_sender=1 WHERE id=%s", (msg_id,))
+                                    else:
+                                        cur.execute("UPDATE messages SET deleted_by_receiver=1 WHERE id=%s", (msg_id,))
+                                    conn.commit()
+                                    print(f"[INFO] Message {msg_id} hidden for {user}")
                             else:
                                 print(f"[WARN] User {user} tried to delete message {msg_id} without permission")
                     except Exception as e:
@@ -404,6 +706,7 @@ async def safe_write(writer, data):
         return False
 
 async def main():
+    ensure_schema()
     server = await asyncio.start_server(
         handle_client, 
         '0.0.0.0', 

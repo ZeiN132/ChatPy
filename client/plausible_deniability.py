@@ -3,6 +3,7 @@
 import os
 import json
 import hashlib
+import bcrypt
 from pathlib import Path
 
 class PlausibleDeniability:
@@ -54,7 +55,21 @@ class PlausibleDeniability:
     
     def _hash_password(self, password):
         """Хешировать пароль для безопасного хранения"""
-        return hashlib.sha256(password.encode()).hexdigest()
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    def _verify_password(self, password, stored_hash):
+        if not stored_hash:
+            return False
+        if (
+            isinstance(stored_hash, str)
+            and len(stored_hash) == 64
+            and all(c in "0123456789abcdef" for c in stored_hash.lower())
+        ):
+            return hashlib.sha256(password.encode()).hexdigest() == stored_hash
+        try:
+            return bcrypt.checkpw(password.encode(), stored_hash.encode())
+        except Exception:
+            return False
     
     def _get_default_fake_messages(self):
         """Получить набор невинных сообщений по умолчанию"""
@@ -115,8 +130,18 @@ class PlausibleDeniability:
         if username not in self.decoy_passwords:
             return False
         
-        password_hash = self._hash_password(password)
-        return self.decoy_passwords[username] == password_hash
+        stored = self.decoy_passwords[username]
+        if self._verify_password(password, stored):
+            # Upgrade legacy SHA-256 hash to bcrypt on successful login
+            if (
+                isinstance(stored, str)
+                and len(stored) == 64
+                and all(c in "0123456789abcdef" for c in stored.lower())
+            ):
+                self.decoy_passwords[username] = self._hash_password(password)
+                self._save_decoy_passwords()
+            return True
+        return False
     
     def get_fake_messages(self, peer):
         """
