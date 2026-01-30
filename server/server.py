@@ -520,6 +520,15 @@ async def handle_client(reader, writer):
                     })
                     print(f"[SECURE] {user} {'accepted' if accepted else 'declined'} secure session with {peer}")
 
+            # ---------- SECURE KEY EXCHANGE ----------
+            elif mtype == "secure_key_exchange" and user:
+                peer = msg.get("peer")
+                if peer and peer in clients:
+                    fwd = dict(msg)
+                    fwd["from"] = user
+                    await safe_write(clients[peer], fwd)
+                    print(f"[SECURE] Relayed key exchange from {user} to {peer}")
+
             # ---------- SEND MESSAGE ----------
             elif mtype == "msg" and user:
                 to_user = msg["to"]

@@ -1,7 +1,17 @@
 import socket
 import threading
 import json
-from .crypto_utils import derive_shared_key
+import os
+import base64
+from .crypto_utils import (
+    derive_shared_key,
+    generate_ephemeral,
+    ecdh_shared_secret,
+    derive_session_chains,
+    kdf_chain,
+    encrypt_msg,
+    decrypt_msg
+)
 
 class ClientNetwork:
     def __init__(self, signals):
@@ -10,7 +20,9 @@ class ClientNetwork:
         self.sock = None
         self.file = None
         self.keys = {}
+        self.sessions = {}
         self.username = None
+        self._rekey_after = 100
 
     def connect(self):
         try:
@@ -93,6 +105,9 @@ class ClientNetwork:
                 if peer is not None:
                     print(f"[SECURE] Received secure session response from {peer}: {accepted}")
                     self.signals.secure_session_response.emit(peer, accepted)
+
+            elif msg_type == "secure_key_exchange":
+                self._handle_key_exchange(msg)
             
             elif msg_type == "msg":
                 # Входящее сообщение от другого пользователя
@@ -134,6 +149,120 @@ class ClientNetwork:
         except Exception as e:
             print("[SEND ERROR]", e)
             self.connected = False
+
+    def _new_session(self, peer, initiator, session_id=None):
+        priv, pub = generate_ephemeral()
+        if session_id is None:
+            session_id = base64.urlsafe_b64encode(os.urandom(9)).decode("ascii").rstrip("=")
+        return {
+            "session_id": session_id,
+            "initiator": initiator,
+            "my_priv": priv,
+            "my_pub": pub,
+            "their_pub": None,
+            "send_chain": None,
+            "recv_chain": None,
+            "send_count": 0,
+            "recv_count": 0,
+            "msg_count": 0,
+            "rekey_after": self._rekey_after,
+            "established": False,
+            "sent_response": False
+        }
+
+    def start_secure_session(self, peer, initiator=True, rekey=False):
+        if not peer:
+            return
+        session = self._new_session(peer, initiator)
+        self.sessions[peer] = session
+        self._send_key_exchange(peer, session, is_response=False, rekey=rekey)
+
+    def clear_session(self, peer):
+        if peer in self.sessions:
+            self.sessions.pop(peer, None)
+
+    def _send_key_exchange(self, peer, session, is_response=False, rekey=False):
+        payload = {
+            "type": "secure_key_exchange",
+            "peer": peer,
+            "from": self.username,
+            "pub": base64.b64encode(session["my_pub"]).decode("ascii"),
+            "session_id": session["session_id"],
+            "response": is_response,
+            "rekey": rekey
+        }
+        self.send(payload)
+
+    def _handle_key_exchange(self, msg):
+        peer = msg.get("from") or msg.get("peer")
+        pub_b64 = msg.get("pub")
+        if not peer or not pub_b64:
+            return
+
+        try:
+            peer_pub = base64.b64decode(pub_b64)
+        except Exception:
+            return
+
+        rekey = bool(msg.get("rekey"))
+        incoming_sid = msg.get("session_id")
+        session = self.sessions.get(peer)
+
+        if session is None or rekey:
+            session = self._new_session(peer, initiator=False, session_id=incoming_sid)
+            self.sessions[peer] = session
+        elif incoming_sid:
+            session["session_id"] = incoming_sid
+
+        session["their_pub"] = peer_pub
+        try:
+            shared = ecdh_shared_secret(session["my_priv"], peer_pub)
+        except Exception:
+            return
+
+        send_chain, recv_chain = derive_session_chains(shared, initiator=session["initiator"])
+        session["send_chain"] = send_chain
+        session["recv_chain"] = recv_chain
+        session["established"] = True
+
+        if not msg.get("response") and not session["initiator"] and not session["sent_response"]:
+            session["sent_response"] = True
+            self._send_key_exchange(peer, session, is_response=True, rekey=rekey)
+
+    def encrypt_for(self, peer, plaintext_bytes):
+        session = self.sessions.get(peer)
+        if not session or not session.get("established"):
+            return None
+
+        if session["msg_count"] >= session["rekey_after"]:
+            self.start_secure_session(peer, initiator=True, rekey=True)
+            session["msg_count"] = 0
+
+        session["send_count"] += 1
+        session["send_chain"], msg_key = kdf_chain(session["send_chain"])
+        session["msg_count"] += 1
+        payload = encrypt_msg(msg_key, plaintext_bytes)
+        payload["n"] = session["send_count"]
+        payload["session_id"] = session["session_id"]
+        return payload
+
+    def decrypt_from(self, peer, encrypted_payload):
+        session = self.sessions.get(peer)
+        if not session or not session.get("established"):
+            raise ValueError("Secure session not established")
+
+        msg_num = encrypted_payload.get("n")
+        sess_id = encrypted_payload.get("session_id")
+        if not isinstance(msg_num, int) or msg_num <= 0:
+            raise ValueError("Invalid message number")
+        if sess_id != session["session_id"]:
+            raise ValueError("Session mismatch")
+        if msg_num != session["recv_count"] + 1:
+            raise ValueError("Out-of-order or replayed message")
+
+        session["recv_chain"], msg_key = kdf_chain(session["recv_chain"])
+        session["recv_count"] = msg_num
+        return decrypt_msg(msg_key, encrypted_payload)
 
     def register(self, username, password, recovery_phrase):
         self.send({

@@ -1853,7 +1853,7 @@ class LoginWindow(QWidget):
         lay.setContentsMargins(40, 30, 40, 30)
 
         title = QLabel("Chat")
-        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #0078d4;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.user = QLineEdit()
@@ -2438,7 +2438,8 @@ class ChatWindow(QWidget):
             "peer": peer,
             "accepted": True
         })
-        
+
+        self.net.start_secure_session(peer, initiator=False)
         self.enable_secure_session(peer)
         
         QMessageBox.information(
@@ -2463,6 +2464,7 @@ class ChatWindow(QWidget):
 
     def on_secure_session_response(self, peer, accepted):
         if accepted:
+            self.net.start_secure_session(peer, initiator=True)
             self.enable_secure_session(peer)
             QMessageBox.information(
                 self,
@@ -2531,6 +2533,7 @@ class ChatWindow(QWidget):
         
         try:
             self.net.close_secure_chat(peer)
+            self.net.clear_session(peer)
             self.secure_storage.clear_peer_messages(peer, self.forensic)
             self.forensic.secure_wipe_memory()
             self.secure_sessions[peer] = False
@@ -2550,10 +2553,6 @@ class ChatWindow(QWidget):
     def _send_file_in_chunks(self, filename, file_bytes):
         if not self.peer:
             return
-        key = self.net.get_key(self.peer)
-        if not key:
-            QMessageBox.warning(self, "Error", "Encryption key not found.")
-            return
 
         file_id = base64.urlsafe_b64encode(os.urandom(9)).decode("ascii").rstrip("=")
         total = (len(file_bytes) + self._file_chunk_size - 1) // self._file_chunk_size
@@ -2563,7 +2562,14 @@ class ChatWindow(QWidget):
             start = idx * self._file_chunk_size
             end = start + self._file_chunk_size
             chunk = file_bytes[start:end]
-            encrypted = encrypt_msg(key, chunk)
+            if secure_mode:
+                encrypted = self.net.encrypt_for(self.peer, chunk)
+            else:
+                key = self.net.get_key(self.peer)
+                if not key:
+                    QMessageBox.warning(self, "Error", "Encryption key not found.")
+                    return
+                encrypted = encrypt_msg(key, chunk)
             payload = {
                 "type": "file_chunk",
                 "file_id": file_id,
@@ -2586,12 +2592,14 @@ class ChatWindow(QWidget):
         if not file_id or total is None or idx is None or not name or not isinstance(enc, dict):
             return
 
-        key = self.net.get_key(self.peer)
-        if not key:
-            return
-
         try:
-            chunk_bytes = decrypt_msg(key, enc)
+            if self.is_secure_session_active():
+                chunk_bytes = self.net.decrypt_from(self.peer, enc)
+            else:
+                key = self.net.get_key(self.peer)
+                if not key:
+                    return
+                chunk_bytes = decrypt_msg(key, enc)
         except Exception as e:
             print(f"[DECRYPT ERROR] {e}")
             return
@@ -2719,11 +2727,13 @@ class ChatWindow(QWidget):
             if i.widget(): i.widget().deleteLater()
 
     def decrypt_payload(self, payload, peer):
-        key = self.net.get_key(peer)
-
         if isinstance(payload, dict) and 'nonce' in payload and 'ciphertext' in payload:
             try:
-                decrypted_bytes = decrypt_msg(key, payload)
+                if self.is_secure_session_active():
+                    decrypted_bytes = self.net.decrypt_from(peer, payload)
+                else:
+                    key = self.net.get_key(peer)
+                    decrypted_bytes = decrypt_msg(key, payload)
                 return decrypted_bytes.decode('utf-8')
             except Exception as e:
                 print(f"[DECRYPT ERROR] {e}")
@@ -2760,24 +2770,28 @@ class ChatWindow(QWidget):
                 file_name = parts[1]
                 encrypted_data_json = parts[2]
 
-                key = self.net.get_key(self.peer)
-
-                if key:
-                    encrypted_dict = json.loads(encrypted_data_json)
-                    file_bytes = decrypt_msg(key, encrypted_dict)
+                encrypted_dict = json.loads(encrypted_data_json)
+                file_bytes = None
+                if self.is_secure_session_active():
+                    file_bytes = self.net.decrypt_from(self.peer, encrypted_dict)
                     is_file = True
-
-                    if file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                        lbl = QLabel()
-                        pix = QPixmap()
-                        if pix.loadFromData(file_bytes):
-                            lbl.setPixmap(pix.scaled(250, 250, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-                        else:
-                            lbl = QLabel(f"❌ Format error: {file_name}")
-                    else:
-                        lbl = QLabel(f"📄 {file_name}\n(File encrypted)")
                 else:
-                    lbl = QLabel(f"❌ Error: Key not found")
+                    key = self.net.get_key(self.peer)
+                    if key:
+                        file_bytes = decrypt_msg(key, encrypted_dict)
+                        is_file = True
+
+                if file_bytes is None:
+                    lbl = QLabel("??? Error: Key not found")
+                elif file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                    lbl = QLabel()
+                    pix = QPixmap()
+                    if pix.loadFromData(file_bytes):
+                        lbl.setPixmap(pix.scaled(250, 250, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    else:
+                        lbl = QLabel(f"??? Format error: {file_name}")
+                else:
+                    lbl = QLabel(f"???? {file_name}\n(File encrypted)")
             except Exception as e:
                 lbl = QLabel(f"❌ Decryption error")
                 print(f"Decrypt error: {e}")
@@ -2906,20 +2920,20 @@ class ChatWindow(QWidget):
     def send_msg(self):
         txt = self.input.text().strip()
         if txt and self.peer:
-            key = self.net.get_key(self.peer)
-            if key:
-                encrypted_payload = encrypt_msg(key, txt.encode())
-                self.net.send_message(
-                    self.peer, 
-                    encrypted_payload, 
-                    secure_mode=self.is_secure_session_active()
-                )
+            secure_mode = self.is_secure_session_active()
+            if secure_mode:
+                encrypted_payload = self.net.encrypt_for(self.peer, txt.encode())
+                if encrypted_payload is None:
+                    QMessageBox.warning(self, "Error", "Secure session not established.")
+                    return
+                self.net.send_message(self.peer, encrypted_payload, secure_mode=True)
             else:
-                self.net.send_message(
-                    self.peer, 
-                    txt, 
-                    secure_mode=self.is_secure_session_active()
-                )
+                key = self.net.get_key(self.peer)
+                if key:
+                    encrypted_payload = encrypt_msg(key, txt.encode())
+                    self.net.send_message(self.peer, encrypted_payload, secure_mode=False)
+                else:
+                    self.net.send_message(self.peer, txt, secure_mode=False)
 
             self.input.clear()
 
