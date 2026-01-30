@@ -2403,6 +2403,8 @@ class ChatWindow(QWidget):
             "type": "secure_session_request",
             "peer": self.peer
         })
+        # Initiator should start key exchange immediately to avoid race.
+        self.net.start_secure_session(self.peer, initiator=True)
 
     def show_secure_session_request(self, peer):
         if hasattr(self, "overlay"):
@@ -2464,7 +2466,7 @@ class ChatWindow(QWidget):
 
     def on_secure_session_response(self, peer, accepted):
         if accepted:
-            self.net.start_secure_session(peer, initiator=True)
+            # Session key exchange already started on request; just enable.
             self.enable_secure_session(peer)
             QMessageBox.information(
                 self,

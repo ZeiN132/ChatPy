@@ -206,10 +206,13 @@ class ClientNetwork:
 
         rekey = bool(msg.get("rekey"))
         incoming_sid = msg.get("session_id")
+        is_response = bool(msg.get("response"))
         session = self.sessions.get(peer)
 
         if session is None or rekey:
-            session = self._new_session(peer, initiator=False, session_id=incoming_sid)
+            # If we receive a response before starting, we are the initiator.
+            initiator = True if is_response else False
+            session = self._new_session(peer, initiator=initiator, session_id=incoming_sid)
             self.sessions[peer] = session
         elif incoming_sid:
             session["session_id"] = incoming_sid
