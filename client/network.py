@@ -232,6 +232,11 @@ class ClientNetwork:
             session["sent_response"] = True
             self._send_key_exchange(peer, session, is_response=True, rekey=rekey)
 
+        try:
+            self.signals.secure_session_established.emit(peer)
+        except Exception:
+            pass
+
     def encrypt_for(self, peer, plaintext_bytes):
         session = self.sessions.get(peer)
         if not session or not session.get("established"):

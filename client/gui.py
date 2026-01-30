@@ -1949,6 +1949,7 @@ class Signals(QObject):
     secure_chat_closed = pyqtSignal(str)
     secure_session_request = pyqtSignal(str)
     secure_session_response = pyqtSignal(str, bool)
+    secure_session_established = pyqtSignal(str)
 
 class ChatWindow(QWidget):
     def __init__(self, net, username, dropbox_mgr):
@@ -1970,6 +1971,7 @@ class ChatWindow(QWidget):
         self.plausible = get_plausible_deniability()
 
         self.secure_sessions = {}
+        self.secure_pending = set()
         self._incoming_files = {}
         self._file_chunk_size = 32 * 1024
 
@@ -2403,6 +2405,7 @@ class ChatWindow(QWidget):
             "type": "secure_session_request",
             "peer": self.peer
         })
+        self.secure_pending.add(self.peer)
         # Initiator should start key exchange immediately to avoid race.
         self.net.start_secure_session(self.peer, initiator=True)
 
@@ -2441,14 +2444,14 @@ class ChatWindow(QWidget):
             "accepted": True
         })
 
+        self.secure_pending.add(peer)
         self.net.start_secure_session(peer, initiator=False)
-        self.enable_secure_session(peer)
         
         QMessageBox.information(
             self,
             "Secure Session Started",
-            f"Secure session with {peer} is now active.\n"
-            f"All messages will be encrypted and auto-deleted."
+            f"Secure session with {peer} is establishing...\n"
+            f"Messages will be encrypted once the key exchange completes."
         )
 
     def reject_secure_session(self, peer):
@@ -2466,13 +2469,13 @@ class ChatWindow(QWidget):
 
     def on_secure_session_response(self, peer, accepted):
         if accepted:
-            # Session key exchange already started on request; just enable.
-            self.enable_secure_session(peer)
+            # Session key exchange already started on request.
+            self.secure_pending.add(peer)
             QMessageBox.information(
                 self,
                 "Secure Session Started",
                 f"{peer} accepted your request!\n"
-                f"Secure session is now active."
+                f"Secure session is establishing..."
             )
         else:
             QMessageBox.warning(
@@ -2484,15 +2487,21 @@ class ChatWindow(QWidget):
     def enable_secure_session(self, peer):
         self.secure_sessions[peer] = True
         self.forensic.enable_secure_mode()
+        if peer in self.secure_pending:
+            self.secure_pending.discard(peer)
         
         if self.peer == peer:
             self.update_secure_ui()
+
+    def on_secure_session_established(self, peer):
+        self.enable_secure_session(peer)
 
     def disable_secure_session(self):
         if not self.peer:
             return
         
         self.secure_sessions[self.peer] = False
+        self.secure_pending.discard(self.peer)
         self.forensic.disable_secure_mode()
         
         self.update_secure_ui()
@@ -2922,6 +2931,9 @@ class ChatWindow(QWidget):
     def send_msg(self):
         txt = self.input.text().strip()
         if txt and self.peer:
+            if self.peer in self.secure_pending and not self.is_secure_session_active():
+                QMessageBox.warning(self, "Error", "Secure session is establishing. Try again in a moment.")
+                return
             secure_mode = self.is_secure_session_active()
             if secure_mode:
                 encrypted_payload = self.net.encrypt_for(self.peer, txt.encode())
@@ -3458,6 +3470,7 @@ class App:
         self.signals.secure_chat_closed.connect(self.on_secure_chat_closed)
         self.signals.secure_session_request.connect(self.on_secure_session_request)
         self.signals.secure_session_response.connect(self.on_secure_session_response)
+        self.signals.secure_session_established.connect(self.on_secure_session_established)
         self.signals.history.connect(lambda p,m: self.chat_win.history(m) if self.chat_win else None)
         self.signals.delete.connect(lambda msg_id: self.chat_win.remove_by_id(msg_id) if self.chat_win else None)
         self.signals.msg_sent.connect(lambda mid, to, payload: self.chat_win.on_msg_sent(mid, to, payload) if self.chat_win else None)
@@ -3492,6 +3505,10 @@ class App:
 
             except Exception as e:
                 print(f"[ERROR] Failed to process secure chat closure: {e}")
+
+    def on_secure_session_established(self, peer):
+        if self.chat_win:
+            self.chat_win.on_secure_session_established(peer)
 
     def on_register(self, data):
         if data.get("status") == "ok":
