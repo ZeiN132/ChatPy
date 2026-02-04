@@ -9,8 +9,8 @@ from bcrypt import hashpw, gensalt, checkpw
 
 DB_CONFIG = {
     "host": "localhost",
-    "user": "root",
-    "password": "root",
+    "user": "chat",
+    "password": "Kateline13680",
     "database": "secure_chat",
     "auth_plugin": "mysql_native_password"
 }
