@@ -1673,6 +1673,10 @@ class SignUpWindow(QWidget):
             QMessageBox.warning(self, "Recovery phrase required", "Generate the 12-word phrase first.")
             return
 
+        if not self.net.connect():
+            QMessageBox.warning(self, "Connection Error", "Unable to connect to server.")
+            return
+
         self.create_btn.setEnabled(False)
         self.net.register(username, password, self._phrase)
 
@@ -1895,16 +1899,37 @@ class LoginWindow(QWidget):
 
         if is_decoy:
             print(f"[PLAUSIBLE] User {username} logging in with DECOY password")
-            self.net.login(username, password, is_decoy=True)
+            self.net.disconnect()
+            self.net.username = username
+            self.net.signals.auth.emit({
+                "status": "ok",
+                "username": username,
+                "is_decoy": True
+            })
         else:
+            if not self.net.connect():
+                QMessageBox.warning(self, "Connection Error", "Unable to connect to server.")
+                return
 
             print(f"[LOGIN] User {username} logging in with NORMAL password")
-            self.net.login(username, password, is_decoy=False)
+            self.net.login(username, password)
+
+    def _register(self, username, password, recovery_phrase):
+        if not self.net.connect():
+            QMessageBox.warning(self, "Connection Error", "Unable to connect to server.")
+            return
+        self.net.register(username, password, recovery_phrase)
+
+    def _reset_password(self, username, recovery_phrase, new_password):
+        if not self.net.connect():
+            QMessageBox.warning(self, "Connection Error", "Unable to connect to server.")
+            return
+        self.net.reset_password(username, recovery_phrase, new_password)
 
     def show_register_dialog(self):
         dialog = RegisterDialog(
             self,
-            on_register=self.net.register,
+            on_register=self._register,
             default_username=self.user.text().strip()
         )
         dialog.exec()
@@ -1932,7 +1957,7 @@ class LoginWindow(QWidget):
     def show_reset_dialog(self):
         dialog = PasswordResetDialog(
             self,
-            on_reset=self.net.reset_password,
+            on_reset=self._reset_password,
             default_username=self.user.text().strip()
         )
         dialog.exec()
@@ -4038,7 +4063,6 @@ class App:
 
         self.signals = Signals()
         self.net = ClientNetwork(self.signals, config_dir=self.profile_dir)
-        self.net.connect()
 
         self.login_win = LoginWindow(self.net)
         self.login_win.show()
@@ -4183,6 +4207,7 @@ class App:
         if self.chat_win:
             self.chat_win.close()
             self.chat_win = None
+        self.net.disconnect()
         try:
             self.dropbox_mgr.clear_user()
         except Exception as e:

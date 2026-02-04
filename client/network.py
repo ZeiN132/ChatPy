@@ -32,6 +32,11 @@ class ClientNetwork:
         self.connected = False
         self.sock = None
         self.file = None
+        self.server_host = os.getenv("CHATPY_SERVER_HOST", "34.46.154.216")
+        try:
+            self.server_port = int(os.getenv("CHATPY_SERVER_PORT", "9999"))
+        except ValueError:
+            self.server_port = 9999
         self.sessions = {}
         self.pending_exchanges = {}
         self.approved_peers = set()
@@ -49,116 +54,142 @@ class ClientNetwork:
         self._rekey_after = 100
 
     def connect(self):
+        if self.connected and self.sock is not None and self.file is not None:
+            return True
         try:
-            self.sock = socket.create_connection(("34.46.154.216", 9999))
+            self.sock = socket.create_connection((self.server_host, self.server_port))
             self.file = self.sock.makefile("rwb")
             self.connected = True
             threading.Thread(target=self.reader, daemon=True).start()
             return True
         except Exception as e:
             print("[NETWORK ERROR]", e)
+            self.disconnect()
             return False
 
-    def reader(self):
-        for line in self.file:
+    def disconnect(self):
+        self.connected = False
+        if self.file is not None:
             try:
-                msg = json.loads(line.decode())
-            except Exception as e:
-                print("[JSON ERROR]", e)
-                continue
-            
-            msg_type = msg.get("type")
-            status = msg.get("status")
+                self.file.close()
+            except Exception:
+                pass
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self.file = None
+        self.sock = None
 
-            if msg_type == "password_reset":
-                self.signals.password_reset.emit(msg)
-                continue
-            if msg_type == "set_recovery_phrase":
-                self.signals.set_recovery_phrase.emit(msg)
-                continue
-            if msg_type == "register":
-                self.signals.register.emit(msg)
-                continue
-            if msg_type == "identity_keys":
-                peer = msg.get("username")
-                if peer:
-                    self.peer_identities[peer] = msg.get("keys", [])
-                    try:
-                        self.signals.identity_keys.emit(peer, msg.get("keys", []))
-                    except Exception:
-                        pass
-                continue
-            if msg_type == "identity_keys_set":
-                continue
+    def reader(self):
+        if self.file is None:
+            self.connected = False
+            return
+        try:
+            for line in self.file:
+                try:
+                    msg = json.loads(line.decode())
+                except Exception as e:
+                    print("[JSON ERROR]", e)
+                    continue
+                
+                msg_type = msg.get("type")
+                status = msg.get("status")
 
-            if status == "ok" or status == "error":
-                if msg.get("auth_stage") == "register":
+                if msg_type == "password_reset":
+                    self.signals.password_reset.emit(msg)
+                    continue
+                if msg_type == "set_recovery_phrase":
+                    self.signals.set_recovery_phrase.emit(msg)
+                    continue
+                if msg_type == "register":
                     self.signals.register.emit(msg)
                     continue
-                # Сохраняем имя пользователя при успешной авторизации
-                if status == "ok" and "username" in msg:
-                    self.username = msg["username"]
-                self.signals.auth.emit(msg)
-                if "users" in msg:
-                    self.signals.users.emit(msg.get("users", []))
-            
-            elif msg_type == "all_users" or "users" in msg:
-                users_list = msg.get("users", [])
-                self.signals.users.emit(users_list)
+                if msg_type == "identity_keys":
+                    peer = msg.get("username")
+                    if peer:
+                        self.peer_identities[peer] = msg.get("keys", [])
+                        try:
+                            self.signals.identity_keys.emit(peer, msg.get("keys", []))
+                        except Exception:
+                            pass
+                    continue
+                if msg_type == "identity_keys_set":
+                    continue
 
-            elif msg_type == "secure_chat_closed":
-                peer = msg.get("peer")
-                action = msg.get("action")
+                if status == "ok" or status == "error":
+                    if msg.get("auth_stage") == "register":
+                        self.signals.register.emit(msg)
+                        continue
+                    # Сохраняем имя пользователя при успешной авторизации
+                    if status == "ok" and "username" in msg:
+                        self.username = msg["username"]
+                    self.signals.auth.emit(msg)
+                    if "users" in msg:
+                        self.signals.users.emit(msg.get("users", []))
                 
-                if peer and action == "delete_all":
-                    print(f"[SECURE] Received command to delete secure chat with {peer}")
-                    self.signals.secure_chat_closed.emit(peer)
-            
-            elif msg_type == "secure_session_request":
-                # Запрос на начало защищённой сессии
-                peer = msg.get("from")
-                if peer:
-                    print(f"[SECURE] Received secure session request from {peer}")
-                    self.signals.secure_session_request.emit(peer)
-            
-            elif msg_type == "secure_session_response":
-                # Ответ на запрос защищённой сессии
-                peer = msg.get("from")
-                accepted = msg.get("accepted", False)
-                if peer is not None:
-                    print(f"[SECURE] Received secure session response from {peer}: {accepted}")
-                    self.signals.secure_session_response.emit(peer, accepted)
+                elif msg_type == "all_users" or "users" in msg:
+                    users_list = msg.get("users", [])
+                    self.signals.users.emit(users_list)
 
-            elif msg_type == "secure_key_exchange":
-                self._handle_key_exchange(msg)
+                elif msg_type == "secure_chat_closed":
+                    peer = msg.get("peer")
+                    action = msg.get("action")
+                    
+                    if peer and action == "delete_all":
+                        print(f"[SECURE] Received command to delete secure chat with {peer}")
+                        self.signals.secure_chat_closed.emit(peer)
+                
+                elif msg_type == "secure_session_request":
+                    # Запрос на начало защищённой сессии
+                    peer = msg.get("from")
+                    if peer:
+                        print(f"[SECURE] Received secure session request from {peer}")
+                        self.signals.secure_session_request.emit(peer)
+                
+                elif msg_type == "secure_session_response":
+                    # Ответ на запрос защищённой сессии
+                    peer = msg.get("from")
+                    accepted = msg.get("accepted", False)
+                    if peer is not None:
+                        print(f"[SECURE] Received secure session response from {peer}: {accepted}")
+                        self.signals.secure_session_response.emit(peer, accepted)
 
-            elif msg_type == "normal_handshake":
-                self._handle_normal_handshake(msg)
-            
-            elif msg_type == "msg":
-                # Входящее сообщение от другого пользователя
-                sender = msg["from"]
-                self.signals.message.emit(
-                    sender, 
-                    msg["payload"], 
-                    msg.get("id")
-                )
-            
-            elif msg_type == "msg_sent":
-                # Подтверждение отправки своего сообщения
-                self.signals.msg_sent.emit(
-                    msg.get("id"),
-                    msg.get("to"),
-                    msg.get("payload")
-                )
-            
-            elif msg_type == "delete_msg":
-                msg_id = msg.get("id")
-                if msg_id is not None:
-                    self.signals.delete.emit(msg_id)
-            
-            elif msg_type == "history":
-                self.signals.history.emit(msg["with"], msg["messages"])
+                elif msg_type == "secure_key_exchange":
+                    self._handle_key_exchange(msg)
+
+                elif msg_type == "normal_handshake":
+                    self._handle_normal_handshake(msg)
+                
+                elif msg_type == "msg":
+                    # Входящее сообщение от другого пользователя
+                    sender = msg["from"]
+                    self.signals.message.emit(
+                        sender, 
+                        msg["payload"], 
+                        msg.get("id")
+                    )
+                
+                elif msg_type == "msg_sent":
+                    # Подтверждение отправки своего сообщения
+                    self.signals.msg_sent.emit(
+                        msg.get("id"),
+                        msg.get("to"),
+                        msg.get("payload")
+                    )
+                
+                elif msg_type == "delete_msg":
+                    msg_id = msg.get("id")
+                    if msg_id is not None:
+                        self.signals.delete.emit(msg_id)
+                
+                elif msg_type == "history":
+                    self.signals.history.emit(msg["with"], msg["messages"])
+        except Exception as e:
+            print("[READER ERROR]", e)
+        finally:
+            self.disconnect()
 
     def send(self, data):
         if not self.connected or self.file is None:
@@ -169,7 +200,7 @@ class ClientNetwork:
             self.file.flush()
         except Exception as e:
             print("[SEND ERROR]", e)
-            self.connected = False
+            self.disconnect()
 
     def ensure_identity_keys(self):
         if not self.username:
@@ -1069,13 +1100,12 @@ class ClientNetwork:
         Args:
             username: Имя пользователя
             password: Пароль
-            is_decoy: True если это вход с фейковым паролем
+            is_decoy: deprecated, reserved for backward compatibility
         """
         self.send({
             "type": "login", 
             "username": username, 
-            "password": password,
-            "is_decoy": is_decoy
+            "password": password
         })
 
     def reset_password(self, username, recovery_phrase, new_password):

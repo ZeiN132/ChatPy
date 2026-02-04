@@ -22,7 +22,14 @@ RESET_MAX_ATTEMPTS = 5
 RESET_LOCK_SECONDS = 60
 RESET_FAIL_DELAY = 1.5
 
+LOGIN_MAX_ATTEMPTS = 6
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_LOCK_SECONDS = 120
+LOGIN_FAIL_DELAY = 1.5
+
 _reset_attempts = {}
+_login_attempts = {}
+DUMMY_PASSWORD_HASH = hashpw(b"chatpy_dummy_password", gensalt())
 
 # ----------------- DB -----------------
 def _load_env_file():
@@ -189,6 +196,57 @@ def derive_recovery_hash(phrase, salt, kdf_params=None):
 def _reset_key(username, addr):
     ip = addr[0] if addr else "unknown"
     return f"{username}:{ip}"
+
+
+def _login_key(username, addr):
+    ip = addr[0] if addr else "unknown"
+    return f"{username}:{ip}"
+
+
+def _dummy_password_check(password):
+    try:
+        checkpw(password, DUMMY_PASSWORD_HASH)
+    except Exception:
+        pass
+
+
+def check_login_limit(key):
+    now = time.monotonic()
+    entry = _login_attempts.get(key)
+    if not entry:
+        return True, 0
+    lock_until = entry.get("lock_until", 0)
+    if lock_until > now:
+        return False, lock_until - now
+    window_started = entry.get("window_started", now)
+    if now - window_started > LOGIN_WINDOW_SECONDS:
+        _login_attempts.pop(key, None)
+    return True, 0
+
+
+def record_login_failure(key):
+    now = time.monotonic()
+    entry = _login_attempts.get(key, {
+        "count": 0,
+        "window_started": now,
+        "lock_until": 0
+    })
+    if now - entry.get("window_started", now) > LOGIN_WINDOW_SECONDS:
+        entry = {
+            "count": 0,
+            "window_started": now,
+            "lock_until": 0
+        }
+    entry["count"] += 1
+    if entry["count"] >= LOGIN_MAX_ATTEMPTS:
+        entry["lock_until"] = now + LOGIN_LOCK_SECONDS
+        entry["count"] = 0
+        entry["window_started"] = now
+    _login_attempts[key] = entry
+
+
+def clear_login_failures(key):
+    _login_attempts.pop(key, None)
 
 def check_reset_limit(key):
     now = time.monotonic()
@@ -371,49 +429,46 @@ async def handle_client(reader, writer):
 
             # ---------- LOGIN ----------
             elif mtype == "login":
-                username = msg["username"]
-                password = msg["password"].encode()
-                is_decoy = msg.get("is_decoy", False)
-                
-                print(f"[DEBUG] Login attempt: username={username}, is_decoy={is_decoy}")
-                
+                username = str(msg.get("username", ""))
+                password_raw = msg.get("password", "")
+                if not isinstance(password_raw, str):
+                    password_raw = ""
+                password = password_raw.encode()
+                login_key = _login_key(username, addr)
+
+                allowed, retry_after = check_login_limit(login_key)
+                if not allowed:
+                    print(f"[LOGIN LIMIT] username={username} ip={addr[0] if addr else 'unknown'} retry_after={int(retry_after)}s")
+                    await asyncio.sleep(LOGIN_FAIL_DELAY)
+                    await safe_write(writer, {"status": "error", "error": "Invalid login"})
+                    continue
+
                 conn = get_db()
                 cur = conn.cursor(dictionary=True)
-                cur.execute("SELECT password_hash, recovery_phrase_hash FROM users WHERE username=%s", (username,))
-                row = cur.fetchone()
-                
-                if not row:
-                    print(f"[DEBUG] User {username} not found in database")
-                    await safe_write(writer, {"status": "error", "error": "Invalid login"})
-                    cur.close()
-                    conn.close()
-                    
-                elif is_decoy:
-                    print(f"[DEBUG] Processing DECOY login for {username}")
-                    # Вход с фейковым паролем - НЕ проверяем основной пароль в БД
-                    await safe_write(writer, {
-                        "status": "ok", 
-                        "username": username, 
-                        "users": [],
-                        "is_decoy": True
-                    })
-                    user = username
-                    clients[user] = writer
-                    print(f"[LOGIN DECOY] User '{user}' logged in with DECOY password from {addr}")
-                    cur.close()
-                    conn.close()
-                    
-                elif not checkpw(password, row["password_hash"]):
-                    print(f"[DEBUG] Wrong password for {username}")
-                    await safe_write(writer, {"status": "error", "error": "Invalid login"})
-                    cur.close()
-                    conn.close()
-                    
-                else:
+                try:
+                    cur.execute("SELECT password_hash, recovery_phrase_hash FROM users WHERE username=%s", (username,))
+                    row = cur.fetchone()
+
+                    valid_login = False
+                    if row and row.get("password_hash"):
+                        try:
+                            valid_login = checkpw(password, row["password_hash"])
+                        except Exception:
+                            valid_login = False
+                    else:
+                        _dummy_password_check(password)
+
+                    if not valid_login:
+                        record_login_failure(login_key)
+                        await asyncio.sleep(LOGIN_FAIL_DELAY)
+                        await safe_write(writer, {"status": "error", "error": "Invalid login"})
+                        continue
+
+                    clear_login_failures(login_key)
                     print(f"[DEBUG] Processing NORMAL login for {username}")
                     await safe_write(writer, {
-                        "status": "ok", 
-                        "username": username, 
+                        "status": "ok",
+                        "username": username,
                         "users": get_all_users(),
                         "is_decoy": False,
                         "recovery_set": bool(row.get("recovery_phrase_hash"))
@@ -421,11 +476,11 @@ async def handle_client(reader, writer):
                     user = username
                     clients[user] = writer
                     print(f"[LOGIN] User '{user}' logged in from {addr}")
-                    
+
                     # Отправка неотправленных сообщений
                     undelivered = get_undelivered_messages(user)
                     print(f"[INFO] User '{user}' has {len(undelivered)} undelivered messages")
-                    
+
                     for msg_data in undelivered:
                         try:
                             payload = msg_data['payload']
@@ -434,7 +489,7 @@ async def handle_client(reader, writer):
                             except:
                                 pass
                             payload = _ensure_payload_purpose(payload, msg_data.get('secure_mode', 0) == 1)
-                            
+
                             success = await safe_write(writer, {
                                 "type": "msg",
                                 "from": msg_data['sender'],
@@ -442,15 +497,15 @@ async def handle_client(reader, writer):
                                 "id": msg_data['id'],
                                 "secure_mode": msg_data.get('secure_mode', 0) == 1
                             })
-                            
+
                             if success:
                                 mark_message_delivered(msg_data['id'])
                             else:
                                 print(f"[FAILED] Failed to deliver message {msg_data['id']} to {user}")
-                                
+
                         except Exception as e:
                             print(f"[ERROR] Failed to process message {msg_data['id']}: {e}")
-                    
+                finally:
                     cur.close()
                     conn.close()
 
