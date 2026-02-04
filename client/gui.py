@@ -13,7 +13,6 @@ from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPropertyAnimation, QEasingCur
 from PyQt6.QtGui import QAction, QGuiApplication, QColor, QPainter, QBrush, QPixmap, QIcon
 from .network import ClientNetwork
 from .dropbox_manager import DropboxManager
-from .crypto_utils import decrypt_msg
 from .identity_keys import IdentityPinStore, fingerprint_ed25519_pub
 from .forensic_protection import get_forensic_protection, get_secure_storage
 from .plausible_deniability import get_plausible_deniability
@@ -3002,7 +3001,7 @@ class ChatWindow(QWidget):
         if self.is_secure_session_active():
             messages = self.secure_storage.get_messages(self.peer)
             for msg in messages:
-                self.bubble(msg['data']['payload'], msg['data']['mine'], msg['id'])
+                self.bubble(msg['data']['payload'], msg['data']['mine'], msg['id'], source="memory")
         else:
             self.net.send({"type": "get_history", "with": self.peer})
 
@@ -3066,6 +3065,8 @@ class ChatWindow(QWidget):
         if not secure_mode and self.is_peer_blocked(self.peer):
             QMessageBox.warning(self, "Untrusted Key", "File sending is blocked due to an untrusted or changed key.")
             return
+        if not secure_mode and not self._ensure_peer_verified(self.peer):
+            return
 
         for idx in range(total):
             start = idx * self._file_chunk_size
@@ -3093,7 +3094,7 @@ class ChatWindow(QWidget):
 
         self._bubble_file(filename, file_bytes, True)
 
-    def _handle_file_chunk(self, payload, mine):
+    def _handle_file_chunk(self, payload, mine, source="live"):
         file_id = payload.get("file_id")
         total = payload.get("total")
         idx = payload.get("idx")
@@ -3120,14 +3121,10 @@ class ChatWindow(QWidget):
                     enc,
                     sender=sender,
                     receiver=receiver,
+                    replay_protect=(source == "live" and not mine),
                 )
             else:
-                if self.is_peer_blocked(self.peer):
-                    return
-                key = self.net.get_key(self.peer)
-                if not key:
-                    return
-                chunk_bytes = decrypt_msg(key, enc)
+                return
         except Exception as e:
             if not (isinstance(enc, dict) and enc.get("purpose") == "normal_v1"):
                 print(f"[DECRYPT ERROR] {e}")
@@ -3255,7 +3252,7 @@ class ChatWindow(QWidget):
             i = self.chat_area.takeAt(0)
             if i.widget(): i.widget().deleteLater()
 
-    def decrypt_payload(self, payload, peer, mine=False):
+    def decrypt_payload(self, payload, peer, mine=False, source="live"):
         if isinstance(payload, dict) and 'nonce' in payload and 'ciphertext' in payload:
             try:
                 if self._payload_is_secure(payload):
@@ -3275,14 +3272,10 @@ class ChatWindow(QWidget):
                             payload,
                             sender=sender,
                             receiver=receiver,
+                            replay_protect=(source == "live" and not mine),
                         )
                     else:
-                        if self.is_peer_blocked(peer):
-                            return "Message blocked"
-                        key = self.net.get_key(peer)
-                        if not key:
-                            return "Key not found"
-                        decrypted_bytes = decrypt_msg(key, payload)
+                        return "Legacy normal message (unsupported)"
                 return decrypted_bytes.decode('utf-8')
             except Exception as e:
                 if not (isinstance(payload, dict) and payload.get("purpose") == "normal_v1"):
@@ -3291,6 +3284,8 @@ class ChatWindow(QWidget):
                     return "Secure message (session pending)"
                 if str(e) == "Normal session not established":
                     return "Normal message (session pending)"
+                if str(e) == "Replayed normal message":
+                    return "Normal message (replay blocked)"
                 if isinstance(payload, dict) and payload.get("purpose") == "normal_v1":
                     return "Normal message (unavailable)"
                 return "Decrypt error"
@@ -3301,9 +3296,9 @@ class ChatWindow(QWidget):
         else:
             return str(payload)
 
-    def bubble(self, payload, mine, msg_id=None):
+    def bubble(self, payload, mine, msg_id=None, source="live"):
         if isinstance(payload, dict) and payload.get("type") == "file_chunk":
-            self._handle_file_chunk(payload, mine)
+            self._handle_file_chunk(payload, mine, source=source)
             return
 
         widget = QWidget()
@@ -3318,7 +3313,7 @@ class ChatWindow(QWidget):
         lbl = None
 
         if isinstance(payload, dict) and 'nonce' in payload and 'ciphertext' in payload:
-            display_text = self.decrypt_payload(payload, self.peer, mine=mine)
+            display_text = self.decrypt_payload(payload, self.peer, mine=mine, source=source)
 
         elif isinstance(payload, str) and payload.startswith("FILE:"):
             try:
@@ -3350,19 +3345,14 @@ class ChatWindow(QWidget):
                             encrypted_dict,
                             sender=sender,
                             receiver=receiver,
+                            replay_protect=(source == "live" and not mine),
                         )
                         is_file = True
                 else:
-                    if self.is_peer_blocked(self.peer):
-                        lbl = QLabel("File blocked")
-                        file_bytes = None
-                    else:
-                        key = self.net.get_key(self.peer)
-                        if key:
-                            file_bytes = decrypt_msg(key, encrypted_dict)
-                            is_file = True
+                    lbl = QLabel("Legacy encrypted file (unsupported)")
+                    file_bytes = None
 
-                if file_bytes is None:
+                if file_bytes is None and lbl is None:
                     lbl = QLabel("??? Error: Key not found")
                 elif file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                     lbl = QLabel()
@@ -3515,11 +3505,13 @@ class ChatWindow(QWidget):
                     QMessageBox.warning(self, "Error", "Secure session not established.")
                     return
                 # Show plaintext immediately for outgoing secure message.
-                self.bubble(txt, True, None)
+                self.bubble(txt, True, None, source="local")
                 self.net.send_message(self.peer, encrypted_payload, secure_mode=True)
             else:
                 if self.is_peer_blocked(self.peer):
                     QMessageBox.warning(self, "Untrusted Key", "Messages are blocked due to an untrusted or changed key.")
+                    return
+                if not self._ensure_peer_verified(self.peer):
                     return
                 encrypted_payload = self.net.encrypt_normal(self.peer, txt.encode())
                 if encrypted_payload is None:
@@ -3536,7 +3528,7 @@ class ChatWindow(QWidget):
                 return
             if isinstance(payload, dict) and payload.get("type") == "file_chunk":
                 return
-            self.bubble(payload, True, msg_id)
+            self.bubble(payload, True, msg_id, source="sent")
 
     def remove_by_id(self, msg_id):
         if msg_id in self.bubbles:
@@ -3554,7 +3546,7 @@ class ChatWindow(QWidget):
 
         self.clear_chat()
         for m in messages:
-            self.bubble(m["payload"], m["sender"] == self.username, m["id"])
+            self.bubble(m["payload"], m["sender"] == self.username, m["id"], source="history")
 
     def closeEvent(self, event):
         active_sessions = [peer for peer, active in self.secure_sessions.items() if active]

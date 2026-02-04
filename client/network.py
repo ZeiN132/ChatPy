@@ -4,9 +4,9 @@ import json
 import os
 import base64
 import time
+from collections import deque
 from cryptography.hazmat.primitives import serialization
 from .crypto_utils import (
-    derive_shared_key,
     generate_ephemeral,
     ecdh_shared_secret,
     derive_session_chains,
@@ -32,11 +32,13 @@ class ClientNetwork:
         self.connected = False
         self.sock = None
         self.file = None
-        self.keys = {}
         self.sessions = {}
         self.pending_exchanges = {}
         self.approved_peers = set()
         self.normal_sessions = {}
+        self._normal_replay = {}
+        self._normal_replay_max_epochs = 8
+        self._normal_replay_max_ids = 4096
         self.config_dir = config_dir or ".chat_config"
         self.identity_mgr = IdentityKeyManager(config_dir=self.config_dir)
         self.identity = None
@@ -56,18 +58,6 @@ class ClientNetwork:
         except Exception as e:
             print("[NETWORK ERROR]", e)
             return False
-
-    def get_key(self, user):
-        """
-        Возвращает ключ шифрования для пользователя.
-        Если ключа нет - генерирует его автоматически.
-        """
-        if user not in self.keys:
-            # Автоматическая генерация ключа на основе имен пользователей
-            if self.username:
-                self.keys[user] = derive_shared_key(self.username, user)
-                print(f"[KEY] Generated key for {user}")
-        return self.keys.get(user)
 
     def reader(self):
         for line in self.file:
@@ -148,11 +138,6 @@ class ClientNetwork:
             elif msg_type == "msg":
                 # Входящее сообщение от другого пользователя
                 sender = msg["from"]
-                # Автоматически создаем ключ для отправителя, если его нет
-                if sender not in self.keys and self.username:
-                    self.keys[sender] = derive_shared_key(self.username, sender)
-                    print(f"[KEY] Auto-generated key for incoming message from {sender}")
-                
                 self.signals.message.emit(
                     sender, 
                     msg["payload"], 
@@ -206,6 +191,7 @@ class ClientNetwork:
     def clear_normal_session(self, peer):
         if peer in self.normal_sessions:
             self.normal_sessions.pop(peer, None)
+        self._normal_replay.pop(peer, None)
 
     def _normal_info(self, a_user, b_user, a_device_id, b_device_id):
         parts = [
@@ -317,6 +303,39 @@ class ClientNetwork:
         if stored and stored.get("master"):
             return stored["master"]
         return None
+
+    def _normal_replay_bucket(self, peer, epoch_id):
+        peer_cache = self._normal_replay.setdefault(peer, {})
+        bucket = peer_cache.get(epoch_id)
+        if bucket is None:
+            bucket = {"seen": set(), "order": deque()}
+            peer_cache[epoch_id] = bucket
+            while len(peer_cache) > self._normal_replay_max_epochs:
+                oldest_epoch = next(iter(peer_cache))
+                peer_cache.pop(oldest_epoch, None)
+        return bucket
+
+    def _normal_replay_seen(self, peer, epoch_id, msg_id):
+        peer_cache = self._normal_replay.get(peer)
+        if not isinstance(peer_cache, dict):
+            return False
+        bucket = peer_cache.get(epoch_id)
+        if not isinstance(bucket, dict):
+            return False
+        seen = bucket.get("seen")
+        return msg_id in seen if isinstance(seen, set) else False
+
+    def _normal_replay_mark(self, peer, epoch_id, msg_id):
+        bucket = self._normal_replay_bucket(peer, epoch_id)
+        seen = bucket["seen"]
+        order = bucket["order"]
+        if msg_id in seen:
+            return
+        seen.add(msg_id)
+        order.append(msg_id)
+        while len(order) > self._normal_replay_max_ids:
+            old_id = order.popleft()
+            seen.discard(old_id)
 
     def _select_peer_device(self, peer):
         devices = self.identity_pins.get_peer(peer)
@@ -753,13 +772,20 @@ class ClientNetwork:
         except Exception:
             pass
 
-    def decrypt_normal_v1(self, peer, payload, sender=None, receiver=None):
+    def decrypt_normal_v1(self, peer, payload, sender=None, receiver=None, replay_protect=False):
         if not isinstance(payload, dict):
             raise ValueError("Invalid payload")
         epoch_id = payload.get("epoch_id")
         msg_id = payload.get("msg_id")
         if not epoch_id or not msg_id:
             raise ValueError("Missing normal session data")
+        if sender is None:
+            sender = peer
+        if receiver is None:
+            receiver = self.username or ""
+        local_user = self.username or ""
+        if replay_protect and sender != local_user and self._normal_replay_seen(peer, epoch_id, msg_id):
+            raise ValueError("Replayed normal message")
         master_key = self._get_normal_epoch_key(peer, epoch_id)
         if not master_key:
             raise ValueError("Normal session not established")
@@ -767,12 +793,11 @@ class ClientNetwork:
         if not msg_id_raw:
             raise ValueError("Invalid message id")
         msg_key = self._normal_msg_key(master_key, msg_id_raw)
-        if sender is None:
-            sender = peer
-        if receiver is None:
-            receiver = self.username or ""
         aad = self._normal_aad(sender, receiver, epoch_id, msg_id)
-        return decrypt_msg(msg_key, payload, aad=aad)
+        plaintext = decrypt_msg(msg_key, payload, aad=aad)
+        if replay_protect and sender != local_user:
+            self._normal_replay_mark(peer, epoch_id, msg_id)
+        return plaintext
 
     def request_identity_keys(self, username):
         if not username:

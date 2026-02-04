@@ -1,19 +1,16 @@
 import asyncio
 import json
 import hashlib
+import os
 import secrets
 import time
+from pathlib import Path
 import mysql.connector
 from mysql.connector import Error
 from bcrypt import hashpw, gensalt, checkpw
 
-DB_CONFIG = {
-    "host": "localhost",
-    "user": "chat",
-    "password": "Kateline13680",
-    "database": "secure_chat",
-    "auth_plugin": "mysql_native_password"
-}
+DB_RUNTIME_CONFIG = None
+DB_MIGRATOR_CONFIG = None
 
 RECOVERY_KDF_DEFAULTS = {
     "kdf": "pbkdf2_sha256",
@@ -28,12 +25,99 @@ RESET_FAIL_DELAY = 1.5
 _reset_attempts = {}
 
 # ----------------- DB -----------------
+def _load_env_file():
+    explicit = os.getenv("CHATPY_ENV_FILE")
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    script_dir = Path(__file__).resolve().parent
+    candidates.extend([
+        Path.cwd() / ".env",
+        script_dir / ".env",
+        script_dir.parent / ".env",
+    ])
+
+    checked = set()
+    for path in candidates:
+        marker = str(path.resolve()) if path.exists() else str(path.absolute())
+        if marker in checked:
+            continue
+        checked.add(marker)
+        if not path.is_file():
+            continue
+
+        with path.open("r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+
+        print(f"[CONFIG] Loaded .env: {path}")
+        return
+
+
+def _require_env(name):
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def init_db_configs():
+    global DB_RUNTIME_CONFIG, DB_MIGRATOR_CONFIG
+    if DB_RUNTIME_CONFIG is not None and DB_MIGRATOR_CONFIG is not None:
+        return
+
+    _load_env_file()
+
+    host = _require_env("CHATPY_DB_HOST")
+    database = _require_env("CHATPY_DB_NAME")
+    auth_plugin = os.getenv("CHATPY_DB_AUTH_PLUGIN", "mysql_native_password")
+
+    runtime_user = _require_env("CHATPY_DB_RUNTIME_USER")
+    runtime_password = _require_env("CHATPY_DB_RUNTIME_PASSWORD")
+    migrator_user = _require_env("CHATPY_DB_MIGRATOR_USER")
+    migrator_password = _require_env("CHATPY_DB_MIGRATOR_PASSWORD")
+
+    DB_RUNTIME_CONFIG = {
+        "host": host,
+        "user": runtime_user,
+        "password": runtime_password,
+        "database": database,
+        "auth_plugin": auth_plugin,
+    }
+    DB_MIGRATOR_CONFIG = {
+        "host": host,
+        "user": migrator_user,
+        "password": migrator_password,
+        "database": database,
+        "auth_plugin": auth_plugin,
+    }
+
+
 def get_db():
-    conn = mysql.connector.connect(**DB_CONFIG)
+    if DB_RUNTIME_CONFIG is None:
+        raise RuntimeError("DB runtime config is not initialized")
+    conn = mysql.connector.connect(**DB_RUNTIME_CONFIG)
     return conn
 
+
+def get_migrator_db():
+    if DB_MIGRATOR_CONFIG is None:
+        raise RuntimeError("DB migrator config is not initialized")
+    conn = mysql.connector.connect(**DB_MIGRATOR_CONFIG)
+    return conn
+
+
 def ensure_schema():
-    conn = get_db()
+    conn = get_migrator_db()
     cur = conn.cursor()
     cur.execute("SHOW COLUMNS FROM users LIKE 'recovery_phrase_hash'")
     if not cur.fetchone():
@@ -808,6 +892,7 @@ async def safe_write(writer, data):
         return False
 
 async def main():
+    init_db_configs()
     ensure_schema()
     server = await asyncio.start_server(
         handle_client, 
@@ -827,5 +912,7 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except RuntimeError as e:
+        print(f"[FATAL] {e}")
     except KeyboardInterrupt:
         print("\n[INFO] Server stopped by user")    
