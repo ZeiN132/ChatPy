@@ -2,7 +2,7 @@ import os
 import hashlib
 import hmac
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 
@@ -31,6 +31,18 @@ def load_public_key(public_bytes):
     """Load X25519 public key from raw bytes."""
     return x25519.X25519PublicKey.from_public_bytes(public_bytes)
 
+def load_private_key(private_bytes):
+    """Load X25519 private key from raw bytes."""
+    return x25519.X25519PrivateKey.from_private_bytes(private_bytes)
+
+def load_ed25519_public_key(public_bytes):
+    """Load Ed25519 public key from raw bytes."""
+    return ed25519.Ed25519PublicKey.from_public_bytes(public_bytes)
+
+def load_ed25519_private_key(private_bytes):
+    """Load Ed25519 private key from raw bytes."""
+    return ed25519.Ed25519PrivateKey.from_private_bytes(private_bytes)
+
 def ecdh_shared_secret(private_key, peer_public_bytes):
     """Compute X25519 shared secret."""
     peer_pub = load_public_key(peer_public_bytes)
@@ -41,6 +53,16 @@ def _hkdf_expand(key_material, info, length=32):
         algorithm=hashes.SHA256(),
         length=length,
         salt=None,
+        info=info
+    )
+    return hkdf.derive(key_material)
+
+def hkdf_derive(key_material, salt, info, length=32):
+    """HKDF with explicit salt and info."""
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=salt,
         info=info
     )
     return hkdf.derive(key_material)
@@ -63,7 +85,7 @@ def kdf_chain(chain_key):
     next_chain = hmac.new(chain_key, b"chain", hashlib.sha256).digest()[:32]
     return next_chain, msg_key
 
-def encrypt_msg(key, plaintext):
+def encrypt_msg(key, plaintext, aad=None):
     """
     Шифрует сообщение с использованием ChaCha20-Poly1305.
     
@@ -81,14 +103,14 @@ def encrypt_msg(key, plaintext):
     
     cipher = ChaCha20Poly1305(key)
     nonce = os.urandom(12)  # ChaCha20Poly1305 использует 12-байтный nonce
-    ciphertext = cipher.encrypt(nonce, plaintext, None)
+    ciphertext = cipher.encrypt(nonce, plaintext, aad)
     
     return {
         "nonce": base64.b64encode(nonce).decode('utf-8'),
         "ciphertext": base64.b64encode(ciphertext).decode('utf-8')
     }
 
-def decrypt_msg(key, encrypted_data):
+def decrypt_msg(key, encrypted_data, aad=None):
     """
     Расшифровывает сообщение.
     
@@ -108,6 +130,6 @@ def decrypt_msg(key, encrypted_data):
     ciphertext = base64.b64decode(encrypted_data['ciphertext'])
     
     cipher = ChaCha20Poly1305(key)
-    plaintext = cipher.decrypt(nonce, ciphertext, None)
+    plaintext = cipher.decrypt(nonce, ciphertext, aad)
     
     return plaintext

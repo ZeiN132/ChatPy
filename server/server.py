@@ -59,6 +59,19 @@ def ensure_schema():
             cur.execute("ALTER TABLE messages MODIFY payload MEDIUMTEXT")
         elif col_type in ("tinytext",):
             cur.execute("ALTER TABLE messages MODIFY payload MEDIUMTEXT")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS identity_keys (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(64) NOT NULL,
+            device_id VARCHAR(64) NOT NULL,
+            sign_pub TEXT NOT NULL,
+            dh_pub TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_identity (username, device_id),
+            INDEX idx_identity_user (username)
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -118,6 +131,16 @@ def get_all_users():
     cur.close()
     conn.close()
     return users
+
+def _ensure_payload_purpose(payload, secure_mode):
+    if not isinstance(payload, dict):
+        return payload
+    if not payload.get("purpose"):
+        is_encrypted = "nonce" in payload and "ciphertext" in payload
+        is_secure = payload.get("session_id") and payload.get("n")
+        if is_encrypted or is_secure:
+            payload["purpose"] = "secure" if secure_mode else "normal"
+    return payload
 
 def get_undelivered_messages(username):
     """Получить все неотправленные сообщения для пользователя"""
@@ -324,6 +347,7 @@ async def handle_client(reader, writer):
                                 payload = json.loads(payload)
                             except:
                                 pass
+                            payload = _ensure_payload_purpose(payload, msg_data.get('secure_mode', 0) == 1)
                             
                             success = await safe_write(writer, {
                                 "type": "msg",
@@ -529,11 +553,79 @@ async def handle_client(reader, writer):
                     await safe_write(clients[peer], fwd)
                     print(f"[SECURE] Relayed key exchange from {user} to {peer}")
 
+            # ---------- NORMAL HANDSHAKE ----------
+            elif mtype == "normal_handshake" and user:
+                peer = msg.get("peer")
+                if peer and peer in clients:
+                    fwd = dict(msg)
+                    fwd["from"] = user
+                    await safe_write(clients[peer], fwd)
+                    print(f"[NORMAL] Relayed normal handshake from {user} to {peer}")
+
+            # ---------- SET IDENTITY KEYS ----------
+            elif mtype == "set_identity_keys" and user:
+                device_id = msg.get("device_id")
+                sign_pub = msg.get("sign_pub")
+                dh_pub = msg.get("dh_pub")
+                if not device_id or not sign_pub or not dh_pub:
+                    await safe_write(writer, {
+                        "type": "identity_keys_set",
+                        "status": "error",
+                        "error": "Missing identity key fields"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO identity_keys (username, device_id, sign_pub, dh_pub)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE sign_pub=%s, dh_pub=%s
+                """, (user, device_id, sign_pub, dh_pub, sign_pub, dh_pub))
+                conn.commit()
+                cur.close()
+                conn.close()
+
+                await safe_write(writer, {
+                    "type": "identity_keys_set",
+                    "status": "ok",
+                    "device_id": device_id
+                })
+
+            # ---------- GET IDENTITY KEYS ----------
+            elif mtype == "get_identity_keys" and user:
+                target = msg.get("username") or msg.get("peer")
+                if not target:
+                    await safe_write(writer, {
+                        "type": "identity_keys",
+                        "status": "error",
+                        "error": "Username missing"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                cur.execute("""
+                    SELECT device_id, sign_pub, dh_pub
+                    FROM identity_keys
+                    WHERE username=%s
+                """, (target,))
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+
+                await safe_write(writer, {
+                    "type": "identity_keys",
+                    "username": target,
+                    "keys": rows
+                })
+
             # ---------- SEND MESSAGE ----------
             elif mtype == "msg" and user:
                 to_user = msg["to"]
                 payload = msg["payload"]
                 secure_mode = msg.get("secure_mode", False)
+                payload = _ensure_payload_purpose(payload, secure_mode)
                 
                 if isinstance(payload, dict):
                     payload_str = json.dumps(payload)
@@ -617,6 +709,7 @@ async def handle_client(reader, writer):
                         row['payload'] = json.loads(row['payload'])
                     except:
                         pass
+                    row['payload'] = _ensure_payload_purpose(row['payload'], row.get('secure_mode', 0) == 1)
                 
                 cur.close()
                 conn.close()

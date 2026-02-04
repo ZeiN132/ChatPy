@@ -3,6 +3,8 @@ import threading
 import json
 import os
 import base64
+import time
+from cryptography.hazmat.primitives import serialization
 from .crypto_utils import (
     derive_shared_key,
     generate_ephemeral,
@@ -10,17 +12,37 @@ from .crypto_utils import (
     derive_session_chains,
     kdf_chain,
     encrypt_msg,
-    decrypt_msg
+    decrypt_msg,
+    load_private_key,
+    load_public_key,
+    load_ed25519_public_key,
+    load_ed25519_private_key,
+    hkdf_derive
+)
+from .identity_keys import (
+    IdentityKeyManager,
+    IdentityPinStore,
+    NormalSessionStore,
+    fingerprint_ed25519_pub,
 )
 
 class ClientNetwork:
-    def __init__(self, signals):
+    def __init__(self, signals, config_dir=".chat_config"):
         self.signals = signals
         self.connected = False
         self.sock = None
         self.file = None
         self.keys = {}
         self.sessions = {}
+        self.pending_exchanges = {}
+        self.approved_peers = set()
+        self.normal_sessions = {}
+        self.config_dir = config_dir or ".chat_config"
+        self.identity_mgr = IdentityKeyManager(config_dir=self.config_dir)
+        self.identity = None
+        self.peer_identities = {}
+        self.identity_pins = IdentityPinStore(config_dir=self.config_dir)
+        self.normal_store = NormalSessionStore(config_dir=self.config_dir)
         self.username = None
         self._rekey_after = 100
 
@@ -45,7 +67,7 @@ class ClientNetwork:
             if self.username:
                 self.keys[user] = derive_shared_key(self.username, user)
                 print(f"[KEY] Generated key for {user}")
-        return self.keys.get(user, b"\x00" * 32)
+        return self.keys.get(user)
 
     def reader(self):
         for line in self.file:
@@ -66,6 +88,17 @@ class ClientNetwork:
                 continue
             if msg_type == "register":
                 self.signals.register.emit(msg)
+                continue
+            if msg_type == "identity_keys":
+                peer = msg.get("username")
+                if peer:
+                    self.peer_identities[peer] = msg.get("keys", [])
+                    try:
+                        self.signals.identity_keys.emit(peer, msg.get("keys", []))
+                    except Exception:
+                        pass
+                continue
+            if msg_type == "identity_keys_set":
                 continue
 
             if status == "ok" or status == "error":
@@ -108,6 +141,9 @@ class ClientNetwork:
 
             elif msg_type == "secure_key_exchange":
                 self._handle_key_exchange(msg)
+
+            elif msg_type == "normal_handshake":
+                self._handle_normal_handshake(msg)
             
             elif msg_type == "msg":
                 # Входящее сообщение от другого пользователя
@@ -150,6 +186,602 @@ class ClientNetwork:
             print("[SEND ERROR]", e)
             self.connected = False
 
+    def ensure_identity_keys(self):
+        if not self.username:
+            return None
+        try:
+            identity = self.identity_mgr.get_or_create(self.username)
+        except Exception as e:
+            print(f"[IDENTITY] Failed to load identity keys: {e}")
+            return None
+        self.identity = identity
+        self.send({
+            "type": "set_identity_keys",
+            "device_id": identity.get("device_id"),
+            "sign_pub": identity.get("sign_pub"),
+            "dh_pub": identity.get("dh_pub")
+        })
+        return identity
+
+    def clear_normal_session(self, peer):
+        if peer in self.normal_sessions:
+            self.normal_sessions.pop(peer, None)
+
+    def _normal_info(self, a_user, b_user, a_device_id, b_device_id):
+        parts = [
+            b"chatpy-normal-v1",
+            str(a_user).encode("utf-8"),
+            str(b_user).encode("utf-8"),
+            str(a_device_id).encode("utf-8"),
+            str(b_device_id).encode("utf-8")
+        ]
+        return b"|".join(parts)
+
+    def _normal_sig_data(self, a_device_id, b_user, a_dh_pub, a_eph_pub, salt_session, b_device_id):
+        parts = [
+            b"chatpy-normal-v1",
+            str(a_device_id).encode("utf-8"),
+            str(b_user).encode("utf-8"),
+            str(b_device_id).encode("utf-8"),
+            a_dh_pub,
+            a_eph_pub,
+            salt_session
+        ]
+        return b"|".join(parts)
+
+    def _normal_ack_sig_data(self, a_user, b_user, a_device_id, b_device_id, epoch_id):
+        parts = [
+            b"chatpy-normal-v1-ack",
+            str(a_user).encode("utf-8"),
+            str(b_user).encode("utf-8"),
+            str(a_device_id).encode("utf-8"),
+            str(b_device_id).encode("utf-8"),
+            str(epoch_id).encode("utf-8"),
+        ]
+        return b"|".join(parts)
+
+    def _secure_sig_data(self, a_user, b_user, a_device_id, b_device_id, session_id, a_eph_pub, response, rekey):
+        parts = [
+            b"chatpy-secure-v1",
+            str(a_user).encode("utf-8"),
+            str(b_user).encode("utf-8"),
+            str(a_device_id).encode("utf-8"),
+            str(b_device_id or "").encode("utf-8"),
+            str(session_id).encode("utf-8"),
+            a_eph_pub,
+            b"1" if response else b"0",
+            b"1" if rekey else b"0",
+        ]
+        return b"|".join(parts)
+
+    def _b64u_encode(self, data):
+        return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+    def _b64u_decode(self, data):
+        if not isinstance(data, str):
+            return None
+        padding = "=" * (-len(data) % 4)
+        try:
+            return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+        except Exception:
+            return None
+
+    def _normal_epoch_id(self, salt_session):
+        return self._b64u_encode(salt_session)
+
+    def _normal_msg_id(self):
+        raw = os.urandom(16)
+        return self._b64u_encode(raw), raw
+
+    def _normal_msg_key(self, master_key, msg_id_raw):
+        return hkdf_derive(master_key, msg_id_raw, b"chatpy-normal-msg-v1", length=32)
+
+    def _normal_aad(self, sender, receiver, epoch_id, msg_id):
+        parts = [
+            b"chatpy-normal-v1",
+            str(sender).encode("utf-8"),
+            str(receiver).encode("utf-8"),
+            str(epoch_id).encode("utf-8"),
+            str(msg_id).encode("utf-8"),
+        ]
+        return b"|".join(parts)
+
+    def _load_normal_current(self, peer):
+        if not self.username or not peer:
+            return None
+        epoch_id = self.normal_store.get_current_epoch(self.username, peer)
+        if not epoch_id:
+            return None
+        stored = self.normal_store.get_epoch(self.username, peer, epoch_id)
+        if not stored or not stored.get("master"):
+            return None
+        entry = self.normal_sessions.get(peer, {})
+        entry.update({
+            "current_epoch": epoch_id,
+            "master": stored["master"],
+            "peer_device_id": stored.get("peer_device_id"),
+            "ready": True,
+        })
+        self.normal_sessions[peer] = entry
+        return entry
+
+    def _get_normal_epoch_key(self, peer, epoch_id):
+        session = self.normal_sessions.get(peer, {})
+        if session.get("current_epoch") == epoch_id and session.get("master"):
+            return session.get("master")
+        if session.get("pending_epoch") == epoch_id and session.get("pending_master"):
+            return session.get("pending_master")
+        if not self.username:
+            return None
+        stored = self.normal_store.get_epoch(self.username, peer, epoch_id)
+        if stored and stored.get("master"):
+            return stored["master"]
+        return None
+
+    def _select_peer_device(self, peer):
+        devices = self.identity_pins.get_peer(peer)
+        if not isinstance(devices, dict):
+            return None, None
+        fallback = (None, None)
+        for device_id, record in devices.items():
+            if not isinstance(record, dict):
+                continue
+            if record.get("blocked"):
+                continue
+            dh_pub = record.get("dh_pub")
+            if not dh_pub:
+                continue
+            if record.get("verified"):
+                return device_id, dh_pub
+            if fallback[0] is None:
+                fallback = (device_id, dh_pub)
+        return fallback
+
+    def _find_peer_identity(self, peer, device_id):
+        if not peer or not device_id:
+            return None
+        entries = self.peer_identities.get(peer, [])
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("device_id") == device_id:
+                return entry
+        return None
+
+    def _emit_identity_key_notice(self, peer, device_id, sign_pub, dh_pub):
+        try:
+            self.signals.identity_keys.emit(peer, [{
+                "device_id": device_id,
+                "sign_pub": sign_pub,
+                "dh_pub": dh_pub
+            }])
+        except Exception:
+            pass
+
+    def _load_identity_private(self):
+        if not self.username:
+            return None
+        if not self.identity:
+            try:
+                self.identity = self.identity_mgr.get_or_create(self.username)
+            except Exception:
+                return None
+        try:
+            sign_priv = load_ed25519_private_key(base64.b64decode(self.identity.get("sign_priv", "")))
+            dh_priv = load_private_key(base64.b64decode(self.identity.get("dh_priv", "")))
+        except Exception:
+            return None
+        return sign_priv, dh_priv
+
+    def ensure_normal_session(self, peer):
+        if not peer or not self.username:
+            return None
+
+        session = self.normal_sessions.get(peer, {})
+        if session.get("ready") and session.get("current_epoch") and session.get("master"):
+            return session.get("master"), session.get("current_epoch")
+
+        loaded = self._load_normal_current(peer)
+        if loaded and loaded.get("master") and loaded.get("current_epoch"):
+            return loaded.get("master"), loaded.get("current_epoch")
+
+        if session.get("pending_epoch"):
+            return None
+
+        return self._start_normal_handshake(peer)
+
+    def _start_normal_handshake(self, peer):
+        if not peer or not self.username:
+            return None
+
+        identity = self.ensure_identity_keys()
+        if not identity:
+            return None
+
+        peer_device_id, peer_dh_pub = self._select_peer_device(peer)
+        if not peer_device_id or not peer_dh_pub:
+            self.request_identity_keys(peer)
+            return None
+
+        sign_priv, _ = self._load_identity_private() or (None, None)
+        if not sign_priv:
+            return None
+
+        from cryptography.hazmat.primitives.asymmetric import x25519
+        eph_priv = x25519.X25519PrivateKey.generate()
+
+        eph_pub = eph_priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        try:
+            peer_pub = load_public_key(base64.b64decode(peer_dh_pub))
+        except Exception:
+            return None
+
+        salt_session = os.urandom(32)
+        epoch_id = self._normal_epoch_id(salt_session)
+        shared = eph_priv.exchange(peer_pub)
+        info = self._normal_info(self.username, peer, identity.get("device_id"), peer_device_id)
+        master_key = hkdf_derive(shared, salt_session, info, length=32)
+
+        sig_data = self._normal_sig_data(
+            identity.get("device_id"),
+            peer,
+            base64.b64decode(identity.get("dh_pub", "")),
+            eph_pub,
+            salt_session,
+            peer_device_id
+        )
+        sig = sign_priv.sign(sig_data)
+
+        payload = {
+            "type": "normal_handshake",
+            "stage": "init",
+            "peer": peer,
+            "from": self.username,
+            "epoch_id": epoch_id,
+            "a_device_id": identity.get("device_id"),
+            "a_ed25519_pub": identity.get("sign_pub"),
+            "a_x25519_pub": identity.get("dh_pub"),
+            "a_eph_x25519_pub": base64.b64encode(eph_pub).decode("ascii"),
+            "salt_session": base64.b64encode(salt_session).decode("ascii"),
+            "sig": base64.b64encode(sig).decode("ascii"),
+            "b_device_id": peer_device_id
+        }
+
+        entry = self.normal_sessions.get(peer, {})
+        entry.update({
+            "pending_epoch": epoch_id,
+            "pending_master": master_key,
+            "pending_created": time.time(),
+            "peer_device_id": peer_device_id,
+            "ready": False,
+        })
+        self.normal_sessions[peer] = entry
+        self.normal_store.set_epoch(
+            self.username,
+            peer,
+            epoch_id,
+            master_key,
+            peer_device_id=peer_device_id,
+            created=time.time(),
+            set_current=False,
+        )
+        self.send(payload)
+        return None
+
+    def encrypt_normal(self, peer, plaintext_bytes):
+        if not peer or not self.username:
+            return None
+        session = self.ensure_normal_session(peer)
+        if not session:
+            return None
+        master_key, epoch_id = session
+        msg_id, msg_id_raw = self._normal_msg_id()
+        msg_key = self._normal_msg_key(master_key, msg_id_raw)
+        aad = self._normal_aad(self.username, peer, epoch_id, msg_id)
+        payload = encrypt_msg(msg_key, plaintext_bytes, aad=aad)
+        if isinstance(payload, dict):
+            payload["purpose"] = "normal_v1"
+            payload["epoch_id"] = epoch_id
+            payload["msg_id"] = msg_id
+        return payload
+
+    def _handle_normal_handshake(self, msg):
+        peer = msg.get("from") or msg.get("peer")
+        if not peer:
+            return
+        if not self.username:
+            return
+        stage = msg.get("stage") or "init"
+        if stage == "ack":
+            self._handle_normal_handshake_ack(msg)
+            return
+        a_device_id = msg.get("a_device_id")
+        a_ed_pub = msg.get("a_ed25519_pub")
+        a_dh_pub = msg.get("a_x25519_pub")
+        a_eph_pub_b64 = msg.get("a_eph_x25519_pub")
+        salt_b64 = msg.get("salt_session")
+        sig_b64 = msg.get("sig")
+        b_device_id = msg.get("b_device_id")
+        epoch_id = msg.get("epoch_id")
+
+        if not a_device_id or not a_ed_pub or not a_dh_pub:
+            return
+        if not a_eph_pub_b64 or not salt_b64 or not sig_b64:
+            return
+
+        my_device_id = self.identity_mgr.get_device_id()
+        if b_device_id and b_device_id != my_device_id:
+            return
+
+        if self.identity_pins.is_peer_blocked(peer):
+            return
+
+        fp = fingerprint_ed25519_pub(a_ed_pub)
+        if not fp:
+            return
+
+        pinned = self.identity_pins.get_peer(peer)
+        if isinstance(pinned, dict) and a_device_id in pinned:
+            record = pinned.get(a_device_id, {})
+            if record.get("sign_fp") and record.get("sign_fp") != fp:
+                self.identity_pins.set_device_blocked(peer, a_device_id, True)
+                try:
+                    self.signals.identity_keys.emit(peer, [{
+                        "device_id": a_device_id,
+                        "sign_pub": a_ed_pub,
+                        "dh_pub": a_dh_pub
+                    }])
+                except Exception:
+                    pass
+                return
+            if record.get("dh_pub") and record.get("dh_pub") != a_dh_pub:
+                self.identity_pins.set_device_blocked(peer, a_device_id, True)
+                try:
+                    self.signals.identity_keys.emit(peer, [{
+                        "device_id": a_device_id,
+                        "sign_pub": a_ed_pub,
+                        "dh_pub": a_dh_pub
+                    }])
+                except Exception:
+                    pass
+                return
+
+        try:
+            a_eph_pub = base64.b64decode(a_eph_pub_b64)
+            a_dh_pub_raw = base64.b64decode(a_dh_pub)
+            salt_session = base64.b64decode(salt_b64)
+            sig = base64.b64decode(sig_b64)
+        except Exception:
+            return
+        derived_epoch = self._normal_epoch_id(salt_session)
+        if epoch_id and epoch_id != derived_epoch:
+            return
+        epoch_id = derived_epoch
+
+        sig_data = self._normal_sig_data(
+            a_device_id,
+            self.username or "",
+            a_dh_pub_raw,
+            a_eph_pub,
+            salt_session,
+            my_device_id
+        )
+        try:
+            pub = load_ed25519_public_key(base64.b64decode(a_ed_pub))
+            pub.verify(sig, sig_data)
+        except Exception:
+            return
+
+        privs = self._load_identity_private()
+        if not privs:
+            return
+        _, dh_priv = privs
+
+        try:
+            eph_pub_key = load_public_key(a_eph_pub)
+            shared = dh_priv.exchange(eph_pub_key)
+        except Exception:
+            return
+
+        info = self._normal_info(peer, self.username or "", a_device_id, my_device_id)
+        master_key = hkdf_derive(shared, salt_session, info, length=32)
+        entry = self.normal_sessions.get(peer, {})
+        entry.update({
+            "current_epoch": epoch_id,
+            "master": master_key,
+            "peer_device_id": a_device_id,
+            "ready": True,
+        })
+        self.normal_sessions[peer] = entry
+        self.normal_store.set_epoch(
+            self.username,
+            peer,
+            epoch_id,
+            master_key,
+            peer_device_id=a_device_id,
+            created=time.time(),
+            set_current=True,
+        )
+
+        try:
+            self.signals.identity_keys.emit(peer, [{
+                "device_id": a_device_id,
+                "sign_pub": a_ed_pub,
+                "dh_pub": a_dh_pub
+            }])
+        except Exception:
+            pass
+
+        identity = self.ensure_identity_keys()
+        if not identity:
+            return
+        sign_priv, _ = self._load_identity_private() or (None, None)
+        if not sign_priv:
+            return
+        ack_sig_data = self._normal_ack_sig_data(
+            peer,
+            self.username,
+            a_device_id,
+            identity.get("device_id"),
+            epoch_id,
+        )
+        ack_sig = sign_priv.sign(ack_sig_data)
+        ack_payload = {
+            "type": "normal_handshake",
+            "stage": "ack",
+            "peer": peer,
+            "from": self.username,
+            "epoch_id": epoch_id,
+            "a_device_id": a_device_id,
+            "b_device_id": identity.get("device_id"),
+            "b_ed25519_pub": identity.get("sign_pub"),
+            "b_x25519_pub": identity.get("dh_pub"),
+            "sig": base64.b64encode(ack_sig).decode("ascii"),
+        }
+        self.send(ack_payload)
+
+    def _handle_normal_handshake_ack(self, msg):
+        peer = msg.get("from") or msg.get("peer")
+        if not peer or not self.username:
+            return
+        epoch_id = msg.get("epoch_id")
+        a_device_id = msg.get("a_device_id")
+        b_device_id = msg.get("b_device_id")
+        b_ed_pub = msg.get("b_ed25519_pub")
+        b_dh_pub = msg.get("b_x25519_pub")
+        sig_b64 = msg.get("sig")
+        if not epoch_id or not a_device_id or not b_device_id or not b_ed_pub or not b_dh_pub or not sig_b64:
+            return
+        if self.identity_pins.is_peer_blocked(peer):
+            return
+        my_device_id = self.identity_mgr.get_device_id()
+        if a_device_id != my_device_id:
+            return
+
+        fp = fingerprint_ed25519_pub(b_ed_pub)
+        if not fp:
+            return
+
+        pinned = self.identity_pins.get_peer(peer)
+        if isinstance(pinned, dict) and b_device_id in pinned:
+            record = pinned.get(b_device_id, {})
+            if record.get("sign_fp") and record.get("sign_fp") != fp:
+                self.identity_pins.set_device_blocked(peer, b_device_id, True)
+                try:
+                    self.signals.identity_keys.emit(peer, [{
+                        "device_id": b_device_id,
+                        "sign_pub": b_ed_pub,
+                        "dh_pub": b_dh_pub
+                    }])
+                except Exception:
+                    pass
+                return
+            if record.get("dh_pub") and record.get("dh_pub") != b_dh_pub:
+                self.identity_pins.set_device_blocked(peer, b_device_id, True)
+                try:
+                    self.signals.identity_keys.emit(peer, [{
+                        "device_id": b_device_id,
+                        "sign_pub": b_ed_pub,
+                        "dh_pub": b_dh_pub
+                    }])
+                except Exception:
+                    pass
+                return
+
+        try:
+            sig = base64.b64decode(sig_b64)
+        except Exception:
+            return
+
+        sig_data = self._normal_ack_sig_data(
+            self.username,
+            peer,
+            a_device_id,
+            b_device_id,
+            epoch_id,
+        )
+        try:
+            pub = load_ed25519_public_key(base64.b64decode(b_ed_pub))
+            pub.verify(sig, sig_data)
+        except Exception:
+            return
+
+        pending = self.normal_sessions.get(peer, {})
+        expected_device = pending.get("peer_device_id")
+        if expected_device and expected_device != b_device_id:
+            return
+        master_key = None
+        if pending.get("pending_epoch") == epoch_id:
+            master_key = pending.get("pending_master")
+        if not master_key and self.username:
+            stored = self.normal_store.get_epoch(self.username, peer, epoch_id)
+            if stored:
+                master_key = stored.get("master")
+        if not master_key:
+            return
+
+        pending.update({
+            "current_epoch": epoch_id,
+            "master": master_key,
+            "peer_device_id": b_device_id,
+            "ready": True,
+        })
+        pending.pop("pending_epoch", None)
+        pending.pop("pending_master", None)
+        pending.pop("pending_created", None)
+        self.normal_sessions[peer] = pending
+        self.normal_store.set_epoch(
+            self.username,
+            peer,
+            epoch_id,
+            master_key,
+            peer_device_id=b_device_id,
+            created=time.time(),
+            set_current=True,
+        )
+
+        try:
+            self.signals.identity_keys.emit(peer, [{
+                "device_id": b_device_id,
+                "sign_pub": b_ed_pub,
+                "dh_pub": b_dh_pub
+            }])
+        except Exception:
+            pass
+
+    def decrypt_normal_v1(self, peer, payload, sender=None, receiver=None):
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid payload")
+        epoch_id = payload.get("epoch_id")
+        msg_id = payload.get("msg_id")
+        if not epoch_id or not msg_id:
+            raise ValueError("Missing normal session data")
+        master_key = self._get_normal_epoch_key(peer, epoch_id)
+        if not master_key:
+            raise ValueError("Normal session not established")
+        msg_id_raw = self._b64u_decode(msg_id)
+        if not msg_id_raw:
+            raise ValueError("Invalid message id")
+        msg_key = self._normal_msg_key(master_key, msg_id_raw)
+        if sender is None:
+            sender = peer
+        if receiver is None:
+            receiver = self.username or ""
+        aad = self._normal_aad(sender, receiver, epoch_id, msg_id)
+        return decrypt_msg(msg_key, payload, aad=aad)
+
+    def request_identity_keys(self, username):
+        if not username:
+            return
+        self.send({
+            "type": "get_identity_keys",
+            "username": username
+        })
+
     def _new_session(self, peer, initiator, session_id=None):
         priv, pub = generate_ephemeral()
         if session_id is None:
@@ -177,11 +809,49 @@ class ClientNetwork:
         self.sessions[peer] = session
         self._send_key_exchange(peer, session, is_response=False, rekey=rekey)
 
-    def clear_session(self, peer):
+
+
+    def clear_session(self, peer, keep_pending=False):
         if peer in self.sessions:
             self.sessions.pop(peer, None)
+        if not keep_pending:
+            self.pending_exchanges.pop(peer, None)
+        self.approved_peers.discard(peer)
+
+    def approve_secure_session(self, peer):
+        if not peer:
+            return
+        self.approved_peers.add(peer)
+        pending = self.pending_exchanges.pop(peer, None)
+        if pending:
+            self._handle_key_exchange(pending, allow_unapproved=True)
+            return True
+        return False
+
+    def has_pending_exchange(self, peer):
+        return peer in self.pending_exchanges
 
     def _send_key_exchange(self, peer, session, is_response=False, rekey=False):
+        identity = self.ensure_identity_keys()
+        if not identity:
+            return
+        sign_priv, _ = self._load_identity_private() or (None, None)
+        if not sign_priv:
+            return
+
+        peer_device_id, _ = self._select_peer_device(peer)
+        sig_data = self._secure_sig_data(
+            self.username or "",
+            peer,
+            identity.get("device_id"),
+            peer_device_id,
+            session["session_id"],
+            session["my_pub"],
+            is_response,
+            rekey,
+        )
+        sig = sign_priv.sign(sig_data)
+
         payload = {
             "type": "secure_key_exchange",
             "peer": peer,
@@ -189,24 +859,109 @@ class ClientNetwork:
             "pub": base64.b64encode(session["my_pub"]).decode("ascii"),
             "session_id": session["session_id"],
             "response": is_response,
-            "rekey": rekey
+            "rekey": rekey,
+            "version": "secure_v1",
+            "device_id": identity.get("device_id"),
+            "sign_pub": identity.get("sign_pub"),
+            "dh_pub": identity.get("dh_pub"),
+            "sig": base64.b64encode(sig).decode("ascii"),
         }
+        if peer_device_id:
+            payload["b_device_id"] = peer_device_id
         self.send(payload)
 
-    def _handle_key_exchange(self, msg):
+    def _handle_key_exchange(self, msg, allow_unapproved=False):
         peer = msg.get("from") or msg.get("peer")
         pub_b64 = msg.get("pub")
         if not peer or not pub_b64:
             return
 
-        try:
-            peer_pub = base64.b64decode(pub_b64)
-        except Exception:
+        version = msg.get("version")
+        if version != "secure_v1":
             return
 
         rekey = bool(msg.get("rekey"))
         incoming_sid = msg.get("session_id")
         is_response = bool(msg.get("response"))
+
+        if not allow_unapproved and not is_response and peer not in self.approved_peers:
+            # Wait for user acceptance before processing.
+            self.pending_exchanges[peer] = msg
+            return
+
+        device_id = msg.get("device_id")
+        sign_pub = msg.get("sign_pub")
+        dh_pub = msg.get("dh_pub")
+        sig_b64 = msg.get("sig")
+        b_device_id = msg.get("b_device_id")
+        if not incoming_sid or not device_id or not sign_pub or not sig_b64:
+            return
+
+        if self.identity_pins.is_peer_blocked(peer):
+            return
+
+        my_device_id = self.identity_mgr.get_device_id()
+        if b_device_id and b_device_id != my_device_id:
+            return
+
+        fp = fingerprint_ed25519_pub(sign_pub)
+        if not fp:
+            return
+
+        pinned = self.identity_pins.get_peer(peer)
+        record = pinned.get(device_id, {}) if isinstance(pinned, dict) else {}
+        if record.get("blocked"):
+            return
+
+        peer_entry = self._find_peer_identity(peer, device_id)
+        if isinstance(peer_entry, dict):
+            if peer_entry.get("sign_pub") and peer_entry.get("sign_pub") != sign_pub:
+                self.identity_pins.set_device_blocked(peer, device_id, True)
+                self._emit_identity_key_notice(peer, device_id, sign_pub, dh_pub)
+                return
+            if dh_pub and peer_entry.get("dh_pub") and peer_entry.get("dh_pub") != dh_pub:
+                self.identity_pins.set_device_blocked(peer, device_id, True)
+                self._emit_identity_key_notice(peer, device_id, sign_pub, dh_pub)
+                return
+
+        if record:
+            if record.get("sign_fp") and record.get("sign_fp") != fp:
+                self.identity_pins.set_device_blocked(peer, device_id, True)
+                self._emit_identity_key_notice(peer, device_id, sign_pub, dh_pub)
+                return
+            if dh_pub and record.get("dh_pub") and record.get("dh_pub") != dh_pub:
+                self.identity_pins.set_device_blocked(peer, device_id, True)
+                self._emit_identity_key_notice(peer, device_id, sign_pub, dh_pub)
+                return
+
+        try:
+            peer_pub = base64.b64decode(pub_b64)
+            sig = base64.b64decode(sig_b64)
+        except Exception:
+            return
+
+        sig_data = self._secure_sig_data(
+            peer,
+            self.username or "",
+            device_id,
+            b_device_id,
+            incoming_sid,
+            peer_pub,
+            is_response,
+            rekey,
+        )
+        try:
+            pub = load_ed25519_public_key(base64.b64decode(sign_pub))
+            pub.verify(sig, sig_data)
+        except Exception:
+            self.identity_pins.set_device_blocked(peer, device_id, True)
+            self._emit_identity_key_notice(peer, device_id, sign_pub, dh_pub)
+            return
+
+        if not record:
+            self.identity_pins.pin_device(peer, device_id, fp, dh_pub)
+            self._emit_identity_key_notice(peer, device_id, sign_pub, dh_pub)
+
         session = self.sessions.get(peer)
 
         if session is None or rekey:
@@ -214,8 +969,9 @@ class ClientNetwork:
             initiator = True if is_response else False
             session = self._new_session(peer, initiator=initiator, session_id=incoming_sid)
             self.sessions[peer] = session
-        elif incoming_sid:
-            session["session_id"] = incoming_sid
+        else:
+            if session is not None and incoming_sid:
+                session["session_id"] = incoming_sid
 
         session["their_pub"] = peer_pub
         try:
@@ -252,6 +1008,7 @@ class ClientNetwork:
         payload = encrypt_msg(msg_key, plaintext_bytes)
         payload["n"] = session["send_count"]
         payload["session_id"] = session["session_id"]
+        payload["purpose"] = "secure"
         return payload
 
     def decrypt_from(self, peer, encrypted_payload):
@@ -318,11 +1075,6 @@ class ClientNetwork:
         self.send({"type": "get_history", "with": peer})
 
     def send_message(self, to, text, secure_mode=False):
-        # Убеждаемся, что ключ существует перед отправкой
-        if to not in self.keys and self.username:
-            self.keys[to] = derive_shared_key(self.username, to)
-            print(f"[KEY] Generated key before sending to {to}")
-        
         self.send({
             "type": "msg", 
             "to": to, 
