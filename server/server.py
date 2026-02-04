@@ -53,7 +53,9 @@ def _load_env_file():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, value = line.split("=", 1)
-                key = key.strip()
+                key = key.strip().lstrip("\ufeff")
+                if key.lower().startswith("export "):
+                    key = key[7:].strip()
                 if not key:
                     continue
                 value = value.strip().strip('"').strip("'")
