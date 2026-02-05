@@ -4,6 +4,7 @@ import json
 import os
 import base64
 import time
+import ssl
 from collections import deque
 from cryptography.hazmat.primitives import serialization
 from .crypto_utils import (
@@ -26,6 +27,23 @@ from .identity_keys import (
     fingerprint_ed25519_pub,
 )
 
+def _env_truthy(value):
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_tls_min_version(raw):
+    if not raw:
+        return None
+    val = str(raw).strip().lower().replace("tls", "").replace("v", "")
+    if val in ("1.2", "1_2", "12"):
+        return ssl.TLSVersion.TLSv1_2
+    if val in ("1.3", "1_3", "13"):
+        return ssl.TLSVersion.TLSv1_3
+    return None
+
+
 class ClientNetwork:
     def __init__(self, signals, config_dir=".chat_config"):
         self.signals = signals
@@ -37,6 +55,10 @@ class ClientNetwork:
             self.server_port = int(os.getenv("CHATPY_SERVER_PORT", "9999"))
         except ValueError:
             self.server_port = 9999
+        self.tls_enabled = _env_truthy(os.getenv("CHATPY_TLS_ENABLED", "0"))
+        self.tls_ca_file = os.getenv("CHATPY_TLS_CA_FILE")
+        self.tls_server_name = os.getenv("CHATPY_TLS_SERVER_NAME") or self.server_host
+        self.tls_min_version = _parse_tls_min_version(os.getenv("CHATPY_TLS_MIN_VERSION", "1.2"))
         self.sessions = {}
         self.pending_exchanges = {}
         self.approved_peers = set()
@@ -57,8 +79,19 @@ class ClientNetwork:
         if self.connected and self.sock is not None and self.file is not None:
             return True
         try:
-            self.sock = socket.create_connection((self.server_host, self.server_port))
-            self.file = self.sock.makefile("rwb")
+            raw_sock = socket.create_connection((self.server_host, self.server_port))
+            sock = raw_sock
+            if self.tls_enabled:
+                if not self.tls_ca_file:
+                    print("[TLS ERROR] CHATPY_TLS_CA_FILE is required when TLS is enabled")
+                    raw_sock.close()
+                    return False
+                ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=self.tls_ca_file)
+                if self.tls_min_version:
+                    ctx.minimum_version = self.tls_min_version
+                sock = ctx.wrap_socket(raw_sock, server_hostname=self.tls_server_name)
+            self.sock = sock
+            self.file = sock.makefile("rwb")
             self.connected = True
             threading.Thread(target=self.reader, daemon=True).start()
             return True

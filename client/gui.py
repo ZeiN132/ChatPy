@@ -1857,9 +1857,22 @@ class LoginWindow(QWidget):
         lay.setSpacing(15)
         lay.setContentsMargins(40, 30, 40, 30)
 
-        title = QLabel("Chat")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #0078d4;")
+        #title = QLabel("OffGrid")
+        #title.setStyleSheet("font-size: 24px; font-weight: bold; color: #0078d4;")
+        #title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel("OffGrid")
+
+        title.setStyleSheet("""
+            font-family: 'Inter';
+            font-size: 28px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            color: #b7f7c9;
+        """)
+
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
 
         self.user = QLineEdit()
         self.user.setPlaceholderText("Username")

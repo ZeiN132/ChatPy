@@ -5,6 +5,7 @@ import os
 import secrets
 import time
 from pathlib import Path
+import ssl
 import mysql.connector
 from mysql.connector import Error
 from bcrypt import hashpw, gensalt, checkpw
@@ -77,6 +78,38 @@ def _require_env(name):
     if value is None or value.strip() == "":
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def _env_truthy(value):
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_tls_min_version(raw):
+    if not raw:
+        return None
+    val = str(raw).strip().lower().replace("tls", "").replace("v", "")
+    if val in ("1.2", "1_2", "12"):
+        return ssl.TLSVersion.TLSv1_2
+    if val in ("1.3", "1_3", "13"):
+        return ssl.TLSVersion.TLSv1_3
+    return None
+
+
+def build_server_ssl_context():
+    if not _env_truthy(os.getenv("CHATPY_TLS_ENABLED", "0")):
+        return None
+
+    certfile = _require_env("CHATPY_TLS_CERTFILE")
+    keyfile = _require_env("CHATPY_TLS_KEYFILE")
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    min_version = _parse_tls_min_version(os.getenv("CHATPY_TLS_MIN_VERSION", "1.2"))
+    if min_version:
+        ctx.minimum_version = min_version
+    ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    return ctx
 
 
 def init_db_configs():
@@ -951,14 +984,17 @@ async def safe_write(writer, data):
 async def main():
     init_db_configs()
     ensure_schema()
+    ssl_ctx = build_server_ssl_context()
     server = await asyncio.start_server(
         handle_client, 
         '0.0.0.0', 
         9999, 
-        limit=1024 * 1024 * 10 
+        limit=1024 * 1024 * 10,
+        ssl=ssl_ctx,
     )
     print("=" * 50)
     print("Server running on port 9999 (Max packet: 10MB)")
+    print("Transport: TLS enabled" if ssl_ctx else "Transport: plaintext (TLS disabled)")
     print("Offline message delivery: ENABLED")
     print("Secure mode (anti-forensic): ENABLED")
     print("Secure session protocol: ENABLED")
