@@ -19,6 +19,9 @@ from .plausible_deniability import get_plausible_deniability
 from .graphic_password import GraphicPasswordManager
 from .recovery_phrase import generate_recovery_phrase, generate_recovery_token, normalize_recovery_phrase
 
+CHAT_ITEM_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+CHAT_ITEM_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+
 class OverlayWidget(QWidget):
     clicked = pyqtSignal()
 
@@ -481,11 +484,16 @@ class SettingsPanel(QWidget):
         self.graphic_btn.clicked.connect(self.setup_graphic_password)
         self.graphic_btn.setToolTip("Set an image-based password for opening My Files.")
 
+        self.group_btn = QPushButton("Create Group Chat")
+        self.group_btn.setObjectName("secondary")
+        self.group_btn.clicked.connect(self.create_group_chat)
+        self.group_btn.setToolTip("Create a group chat from the sidebar.")
+
         layout.addWidget(header)
         layout.addWidget(line1)
-        layout.addWidget(self.secure_toggle)
         layout.addWidget(self.plausible_btn)
         layout.addWidget(self.graphic_btn)
+        layout.addWidget(self.group_btn)
         files_btn = QPushButton("My Files")
         files_btn.setObjectName("secondary")
         files_btn.clicked.connect(self.open_files)
@@ -546,6 +554,9 @@ class SettingsPanel(QWidget):
 
     def setup_graphic_password(self):
         self.chat_window.show_graphic_password_dialog()
+
+    def create_group_chat(self):
+        self.chat_window.create_group_chat()
 
     def setup_recovery_phrase(self):
         self.chat_window.show_recovery_setup_dialog()
@@ -1376,9 +1387,10 @@ class ChatDeleteDialog(QFrame):
 
 
 class AddContactDialog(QFrame):
-    def __init__(self, parent, on_add):
+    def __init__(self, parent, on_add, on_close=None):
         super().__init__(parent)
         self.on_add = on_add
+        self.on_close = on_close
         self.setObjectName("ConfirmDialog")
         self.setFixedSize(360, 200)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
@@ -1423,6 +1435,9 @@ class AddContactDialog(QFrame):
         self.cancel()
 
     def cancel(self):
+        if callable(self.on_close):
+            self.on_close()
+            return
         self.parent().fade_out()
         self.deleteLater()
 
@@ -1990,6 +2005,21 @@ class Signals(QObject):
     secure_session_response = pyqtSignal(str, bool)
     secure_session_established = pyqtSignal(str)
     identity_keys = pyqtSignal(str, list)
+    storage_warning = pyqtSignal(str)
+    groups = pyqtSignal(list)
+    group_created = pyqtSignal(dict)
+    group_invites = pyqtSignal(list)
+    group_invite = pyqtSignal(dict)
+    group_invite_sent = pyqtSignal(dict)
+    group_invite_response = pyqtSignal(dict)
+    group_invite_result = pyqtSignal(dict)
+    group_member_added = pyqtSignal(dict)
+    group_member_left = pyqtSignal(dict)
+    group_message = pyqtSignal(object, str, object, object)
+    group_msg_sent = pyqtSignal(object, object, object)
+    group_history = pyqtSignal(object, list)
+    group_left = pyqtSignal(object)
+    group_error = pyqtSignal(dict)
 
 class ChatWindow(QWidget):
     def __init__(self, net, username, dropbox_mgr, config_dir=None):
@@ -2003,8 +2033,12 @@ class ChatWindow(QWidget):
         self.recovery_set = False
         self.logout_callback = None
         self.peer = None
+        self.current_chat_kind = None
+        self.current_group_id = None
         self.bubbles = {}
         self.available_users = []
+        self.group_chats = {}
+        self.pending_group_invites = {}
         self.contacts_file = Path.home() / ".secure_chat" / "contacts.json"
 
         self.forensic = get_forensic_protection()
@@ -2015,7 +2049,10 @@ class ChatWindow(QWidget):
         self.secure_pending = set()
         self._incoming_files = {}
         self._file_chunk_size = 32 * 1024
-        self.identity_pins = IdentityPinStore(config_dir=self.config_dir)
+        self.identity_pins = IdentityPinStore(
+            config_dir=self.config_dir,
+            warning_callback=self._relay_storage_warning,
+        )
         self.blocked_peers = set()
         self._pending_key_changes = {}
         self._pending_verifications = {}
@@ -2143,8 +2180,12 @@ class ChatWindow(QWidget):
         self.send_btn.clicked.connect(self.send_msg)
         self.input.returnPressed.connect(self.send_msg)
         self.files_window = None
+        self._add_contact_dialog = None
         self._keeping_overlay = False
         self._add_contact_open = False
+
+        QTimer.singleShot(0, self.net.request_groups)
+        QTimer.singleShot(0, self.net.request_group_invites)
 
     def close_sidebar(self):
         if self.sidebar.is_open:
@@ -2186,6 +2227,14 @@ class ChatWindow(QWidget):
             (self.height()-220)//2
         )
         dlg.show()
+
+    def _relay_storage_warning(self, message):
+        if not message:
+            return
+        try:
+            self.net.signals.storage_warning.emit(str(message))
+        except Exception:
+            pass
 
     def _format_fingerprint(self, fp):
         if not fp:
@@ -2517,6 +2566,15 @@ class ChatWindow(QWidget):
             self._ensure_peer_verified(peer, action=pending_action)
 
     def show_add_contact_dialog(self):
+        if self._add_contact_dialog is not None:
+            try:
+                if self._add_contact_dialog.isVisible():
+                    self._add_contact_dialog.raise_()
+                    self._add_contact_dialog.activateWindow()
+                    return
+            except Exception:
+                self._add_contact_dialog = None
+
         self.close_sidebar()
         self._add_contact_open = True
         self.overlay.fade_in()
@@ -2527,12 +2585,22 @@ class ChatWindow(QWidget):
             pass
         self.overlay.clicked.connect(self.close_add_contact_dialog)
 
-        dlg = AddContactDialog(self.overlay, self.add_contact)
+        dlg = AddContactDialog(self.overlay, self.add_contact, on_close=self.close_add_contact_dialog)
+        self._add_contact_dialog = dlg
         dlg.move((self.width() - 360) // 2, (self.height() - 200) // 2)
         dlg.show()
 
     def close_add_contact_dialog(self):
+        dlg = self._add_contact_dialog
+        self._add_contact_dialog = None
         self._add_contact_open = False
+
+        if dlg is not None:
+            try:
+                dlg.deleteLater()
+            except Exception:
+                pass
+
         try:
             self.overlay.clicked.disconnect(self.close_add_contact_dialog)
         except Exception:
@@ -2542,30 +2610,261 @@ class ChatWindow(QWidget):
     def add_contact(self, username):
         if not username or username == self.username:
             return
-        for i in range(self.user_list.count()):
-            if self.user_list.item(i).text() == username:
-                return
-        self.user_list.addItem(username)
+        username = str(username).strip()
+        if not username:
+            return
+        if self._find_contact_item(username) is not None:
+            return
+        self.user_list.addItem(self._new_contact_item(username))
         self.save_contacts()
         self.close_add_contact_dialog()
 
     def remove_contact(self, username):
         for i in range(self.user_list.count()):
-            if self.user_list.item(i).text() == username:
+            item = self.user_list.item(i)
+            if self._item_kind(item) == "peer" and self._item_contact(item) == username:
                 self.user_list.takeItem(i)
                 break
         if self.peer == username:
             self.peer = None
+            self.current_chat_kind = None
             self.chat_title.setText("Select a contact...")
             self.clear_chat()
+            self.update_secure_ui()
         self.save_contacts()
 
     def create_group_chat(self):
-        QMessageBox.information(
-            self,
-            "Group Chat",
-            "Group chat is not implemented yet."
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Create Group Chat")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+
+        name_label = QLabel("Group name:")
+        name_input = QLineEdit()
+        name_input.setPlaceholderText("e.g. Diploma Team")
+
+        users_label = QLabel("Initial members (optional):")
+        users_list = QListWidget()
+        users_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        users_list.setMinimumHeight(220)
+
+        candidates = set(self.available_users or [])
+        for i in range(self.user_list.count()):
+            item = self.user_list.item(i)
+            if self._item_kind(item) == "peer":
+                contact = self._item_contact(item)
+                if contact:
+                    candidates.add(contact)
+        candidates.discard(self.username)
+        for username in sorted(candidates):
+            users_list.addItem(username)
+
+        info = QLabel("You can invite more members later from the group context menu.")
+        info.setStyleSheet("color: #9aa0a6; font-size: 12px;")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Create")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        layout.addWidget(name_label)
+        layout.addWidget(name_input)
+        layout.addWidget(users_label)
+        layout.addWidget(users_list)
+        layout.addWidget(info)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name = name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Group chat", "Group name is required.")
+            return
+        members = [item.text() for item in users_list.selectedItems()]
+        self.net.create_group(name, members)
+
+    def invite_member_to_group(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        group = self.group_chats.get(gid, {})
+        current_members = set(group.get("members") or [])
+        current_members.add(self.username)
+
+        candidates = set(self.available_users or [])
+        for i in range(self.user_list.count()):
+            item = self.user_list.item(i)
+            if self._item_kind(item) == "peer":
+                contact = self._item_contact(item)
+                if contact:
+                    candidates.add(contact)
+        candidates = sorted([u for u in candidates if u and u not in current_members])
+        if not candidates:
+            QMessageBox.information(self, "Invite member", "No available users to invite.")
+            return
+
+        username, ok = QInputDialog.getItem(
+            self,
+            "Invite member",
+            "Select user:",
+            candidates,
+            0,
+            False
+        )
+        if not ok or not username:
+            return
+        self.net.invite_group_member(gid, username)
+
+    def leave_group(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        group = self.group_chats.get(gid, {})
+        group_name = group.get("name") or f"Group {gid}"
+        reply = QMessageBox.question(
+            self,
+            "Leave Group",
+            f"Leave group '{group_name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.net.leave_group(gid)
+
+    def _normalize_group_id(self, value):
+        try:
+            gid = int(value)
+        except (TypeError, ValueError):
+            return None
+        return gid if gid > 0 else None
+
+    def _new_contact_item(self, username):
+        item = QListWidgetItem(username)
+        item.setData(CHAT_ITEM_KIND_ROLE, "peer")
+        item.setData(CHAT_ITEM_ID_ROLE, username)
+        return item
+
+    def _new_group_item(self, group_info):
+        group_id = self._normalize_group_id(group_info.get("group_id"))
+        name = str(group_info.get("name") or f"Group {group_id}").strip()
+        item = QListWidgetItem(f"# {name}")
+        item.setData(CHAT_ITEM_KIND_ROLE, "group")
+        item.setData(CHAT_ITEM_ID_ROLE, group_id)
+        return item
+
+    def _item_kind(self, item):
+        if item is None:
+            return None
+        return item.data(CHAT_ITEM_KIND_ROLE)
+
+    def _item_contact(self, item):
+        if item is None:
+            return None
+        if self._item_kind(item) == "peer":
+            return item.data(CHAT_ITEM_ID_ROLE) or item.text()
+        return None
+
+    def _item_group_id(self, item):
+        if item is None:
+            return None
+        if self._item_kind(item) != "group":
+            return None
+        return self._normalize_group_id(item.data(CHAT_ITEM_ID_ROLE))
+
+    def _find_contact_item(self, username):
+        for i in range(self.user_list.count()):
+            item = self.user_list.item(i)
+            if self._item_kind(item) == "peer" and self._item_contact(item) == username:
+                return item
+        return None
+
+    def _find_group_item(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return None
+        for i in range(self.user_list.count()):
+            item = self.user_list.item(i)
+            if self._item_kind(item) == "group" and self._item_group_id(item) == gid:
+                return item
+        return None
+
+    def _upsert_group(self, group_info, select=False):
+        gid = self._normalize_group_id(group_info.get("group_id"))
+        if gid is None:
+            return
+        current = dict(self.group_chats.get(gid) or {})
+        members = current.get("members", [])
+        current.update(group_info or {})
+        current["group_id"] = gid
+        current["members"] = list(members) if isinstance(members, list) else []
+        self.group_chats[gid] = current
+
+        item = self._find_group_item(gid)
+        if item is None:
+            self.user_list.addItem(self._new_group_item(current))
+            item = self._find_group_item(gid)
+        else:
+            item.setText(f"# {current.get('name') or f'Group {gid}'}")
+            item.setData(CHAT_ITEM_ID_ROLE, gid)
+
+        if select and item is not None:
+            self.user_list.setCurrentItem(item)
+            self.select_peer(item)
+
+    def _remove_group(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        self.group_chats.pop(gid, None)
+        item = self._find_group_item(gid)
+        if item is not None:
+            row = self.user_list.row(item)
+            self.user_list.takeItem(row)
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            self.current_group_id = None
+            self.current_chat_kind = None
+            self.peer = None
+            self.chat_title.setText("Select a contact...")
+            self.clear_chat()
+            self.update_secure_ui()
+
+    def load_contacts(self):
+        try:
+            if self.contacts_file.exists():
+                data = json.loads(self.contacts_file.read_text(encoding="utf-8"))
+                users = data.get(self.username, [])
+                for u in users:
+                    if isinstance(u, str):
+                        u = u.strip()
+                    if u and u != self.username and self._find_contact_item(u) is None:
+                        self.user_list.addItem(self._new_contact_item(u))
+        except Exception:
+            pass
+
+    def save_contacts(self):
+        try:
+            self.contacts_file.parent.mkdir(exist_ok=True)
+            data = {}
+            if self.contacts_file.exists():
+                try:
+                    data = json.loads(self.contacts_file.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            users = []
+            for i in range(self.user_list.count()):
+                item = self.user_list.item(i)
+                if self._item_kind(item) != "peer":
+                    continue
+                username = self._item_contact(item)
+                if username:
+                    users.append(username)
+            data[self.username] = users
+            self.contacts_file.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
 
     def delete_fake_chat(self):
         if not self.peer:
@@ -2605,35 +2904,6 @@ class ChatWindow(QWidget):
     def request_logout(self):
         if self.logout_callback:
             self.logout_callback()
-
-    def load_contacts(self):
-        try:
-            if self.contacts_file.exists():
-                data = json.loads(self.contacts_file.read_text(encoding="utf-8"))
-                users = data.get(self.username, [])
-                for u in users:
-                    if isinstance(u, str) and u and u != self.username:
-                        self.user_list.addItem(u)
-        except Exception:
-            pass
-
-    def save_contacts(self):
-        try:
-            self.contacts_file.parent.mkdir(exist_ok=True)
-            data = {}
-            if self.contacts_file.exists():
-                try:
-                    data = json.loads(self.contacts_file.read_text(encoding="utf-8"))
-                except Exception:
-                    data = {}
-            users = []
-            for i in range(self.user_list.count()):
-                users.append(self.user_list.item(i).text())
-            data[self.username] = users
-            self.contacts_file.write_text(json.dumps(data), encoding="utf-8")
-        except Exception:
-            pass
-
 
     def show_plausible_deniability_dialog(self):
         self.close_sidebar()
@@ -3013,7 +3283,11 @@ class ChatWindow(QWidget):
             self.net.request_history(peer)
 
     def select_peer(self, item):
-        if self.peer and self.is_secure_session_active():
+        kind = self._item_kind(item) or "peer"
+        next_peer = self._item_contact(item) if kind == "peer" else None
+        next_group_id = self._item_group_id(item) if kind == "group" else None
+
+        if self.peer and self.is_secure_session_active() and (kind != "peer" or next_peer != self.peer):
             reply = QMessageBox.question(
                 self,
                 "Exit Secure Session",
@@ -3023,25 +3297,39 @@ class ChatWindow(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
             self.close_secure_chat(self.peer)
-        
-        self.peer = item.text()
-        self.chat_title.setText(f"Chat with {self.peer}")
+
         self.clear_chat()
         self.hide_key_banner()
-        
+
+        if kind == "group":
+            self.current_chat_kind = "group"
+            self.current_group_id = next_group_id
+            self.peer = None
+            group = self.group_chats.get(next_group_id, {})
+            group_name = group.get("name") or f"Group {next_group_id}"
+            self.chat_title.setText(f"Group: {group_name}")
+            self.update_secure_ui()
+            if next_group_id is not None:
+                self.net.request_group_history(next_group_id)
+            return
+
+        self.current_chat_kind = "peer"
+        self.current_group_id = None
+        self.peer = next_peer or item.text()
+        self.chat_title.setText(f"Chat with {self.peer}")
         self.update_secure_ui()
 
         self.net.request_identity_keys(self.peer)
         self._show_pending_banner(self.peer)
         if self.peer in self._pending_key_changes:
             self._show_key_change_dialog(self.peer, self._pending_key_changes[self.peer])
-        
+
         if self.is_secure_session_active():
             messages = self.secure_storage.get_messages(self.peer)
             for msg in messages:
                 self.bubble(msg['data']['payload'], msg['data']['mine'], msg['id'], source="memory")
         else:
-            self.net.send({"type": "get_history", "with": self.peer})
+            self.net.request_history(self.peer)
 
     def close_secure_chat(self, peer):
         if not self.secure_sessions.get(peer, False):
@@ -3085,6 +3373,9 @@ class ChatWindow(QWidget):
             print(f"[ERROR] Failed to process secure chat closure: {e}")
 
     def send_file_dialog(self):
+        if self.current_chat_kind == "group":
+            QMessageBox.information(self, "Group Chat", "File transfer in group chats is not implemented yet.")
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Select file", "", "All Files (*)")
         if path and self.peer:
             fname = os.path.basename(path)
@@ -3490,24 +3781,58 @@ class ChatWindow(QWidget):
     def show_contacts_menu(self, pos):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { background-color: #0f1a13; color: #d7ffe6; border: 1px solid #113b21; }")
-        menu.addAction("Add contact", self.show_add_contact_dialog)
 
         item = self.user_list.itemAt(pos)
         if item:
-            menu.addSeparator()
-            menu.addAction("Create group chat", self.create_group_chat)
-            menu.addAction("Verify code", lambda: self.verify_peer_code(item.text()))
-            menu.addAction("Delete chat", lambda: self.remove_contact(item.text()))
+            kind = self._item_kind(item) or "peer"
+            if kind == "group":
+                group_id = self._item_group_id(item)
+                menu.addAction("Invite member", lambda gid=group_id: self.invite_member_to_group(gid))
+                menu.addAction("Leave group", lambda gid=group_id: self.leave_group(gid))
+            else:
+                peer = self._item_contact(item) or item.text()
+                menu.addAction("Enable secure session", lambda: self._start_secure_session_from_contact(item))
+                menu.addAction("Verify code", lambda: self.verify_peer_code(peer))
+                menu.addAction("Delete chat", lambda: self.remove_contact(peer))
+        else:
+            menu.addAction("Add contact", self.show_add_contact_dialog)
 
         menu.exec(self.user_list.mapToGlobal(pos))
+
+    def _activate_contact(self, item):
+        if item is None:
+            return False
+        if (self._item_kind(item) or "peer") != "peer":
+            return False
+        peer = self._item_contact(item) or item.text()
+        if self.peer == peer:
+            return True
+        self.user_list.setCurrentItem(item)
+        self.select_peer(item)
+        return self.peer == peer
+
+    def _start_secure_session_from_contact(self, item):
+        if not self._activate_contact(item):
+            return
+        peer = self._item_contact(item) or item.text()
+        if self.secure_sessions.get(peer, False):
+            QMessageBox.information(self, "Secure Session", "Secure session is already active.")
+            return
+        if peer in self.secure_pending:
+            QMessageBox.information(self, "Secure Session", "Secure session is establishing.")
+            return
+        self.request_secure_session()
 
     def show_chat_menu(self, pos):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { background-color: #0f1a13; color: #d7ffe6; border: 1px solid #113b21; }")
         menu.addAction("Add contact", self.show_add_contact_dialog)
-        if self.peer:
+        if self.current_chat_kind == "group" and self.current_group_id is not None:
             menu.addSeparator()
-            menu.addAction("Create group chat", self.create_group_chat)
+            menu.addAction("Invite member", lambda gid=self.current_group_id: self.invite_member_to_group(gid))
+            menu.addAction("Leave group", lambda gid=self.current_group_id: self.leave_group(gid))
+        elif self.peer:
+            menu.addSeparator()
             menu.addAction("Delete chat", self.delete_chat)
         menu.exec(self.scroll.viewport().mapToGlobal(pos))
 
@@ -3529,35 +3854,45 @@ class ChatWindow(QWidget):
 
     def send_msg(self):
         txt = self.input.text().strip()
-        if txt and self.peer:
-            if self.peer in self.secure_pending and not self.is_secure_session_active():
-                QMessageBox.warning(self, "Error", "Secure session is establishing. Try again in a moment.")
-                return
-            secure_mode = self.is_secure_session_active()
-            if secure_mode:
-                if self.is_peer_blocked(self.peer):
-                    QMessageBox.warning(self, "Untrusted Key", "Secure session is blocked due to an untrusted or changed key.")
-                    return
-                encrypted_payload = self.net.encrypt_for(self.peer, txt.encode())
-                if encrypted_payload is None:
-                    QMessageBox.warning(self, "Error", "Secure session not established.")
-                    return
-                # Show plaintext immediately for outgoing secure message.
-                self.bubble(txt, True, None, source="local")
-                self.net.send_message(self.peer, encrypted_payload, secure_mode=True)
-            else:
-                if self.is_peer_blocked(self.peer):
-                    QMessageBox.warning(self, "Untrusted Key", "Messages are blocked due to an untrusted or changed key.")
-                    return
-                if not self._ensure_peer_verified(self.peer):
-                    return
-                encrypted_payload = self.net.encrypt_normal(self.peer, txt.encode())
-                if encrypted_payload is None:
-                    QMessageBox.warning(self, "Normal session", "Normal session is establishing. Try again in a moment.")
-                    return
-                self.net.send_message(self.peer, encrypted_payload, secure_mode=False)
+        if not txt:
+            return
 
+        if self.current_chat_kind == "group" and self.current_group_id is not None:
+            self.net.send_group_message(self.current_group_id, txt, secure_mode=False)
             self.input.clear()
+            return
+
+        if not self.peer:
+            return
+
+        if self.peer in self.secure_pending and not self.is_secure_session_active():
+            QMessageBox.warning(self, "Error", "Secure session is establishing. Try again in a moment.")
+            return
+        secure_mode = self.is_secure_session_active()
+        if secure_mode:
+            if self.is_peer_blocked(self.peer):
+                QMessageBox.warning(self, "Untrusted Key", "Secure session is blocked due to an untrusted or changed key.")
+                return
+            encrypted_payload = self.net.encrypt_for(self.peer, txt.encode())
+            if encrypted_payload is None:
+                QMessageBox.warning(self, "Error", "Secure session not established.")
+                return
+            # Show plaintext immediately for outgoing secure message.
+            self.bubble(txt, True, None, source="local")
+            self.net.send_message(self.peer, encrypted_payload, secure_mode=True)
+        else:
+            if self.is_peer_blocked(self.peer):
+                QMessageBox.warning(self, "Untrusted Key", "Messages are blocked due to an untrusted or changed key.")
+                return
+            if not self._ensure_peer_verified(self.peer):
+                return
+            encrypted_payload = self.net.encrypt_normal(self.peer, txt.encode())
+            if encrypted_payload is None:
+                QMessageBox.warning(self, "Normal session", "Normal session is establishing. Try again in a moment.")
+                return
+            self.net.send_message(self.peer, encrypted_payload, secure_mode=False)
+
+        self.input.clear()
 
     def on_msg_sent(self, msg_id, to_user, payload):
         if to_user == self.peer:
@@ -3567,6 +3902,180 @@ class ChatWindow(QWidget):
             if isinstance(payload, dict) and payload.get("type") == "file_chunk":
                 return
             self.bubble(payload, True, msg_id, source="sent")
+
+    def on_group_msg_sent(self, msg_id, group_id, payload):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            if isinstance(payload, dict) and payload.get("type") == "file_chunk":
+                return
+            self.bubble(payload, True, msg_id, source="sent")
+
+    def on_group_message(self, group_id, sender, payload, msg_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        group = self.group_chats.get(gid)
+        if group is None:
+            self.net.request_groups()
+        else:
+            members = set(group.get("members") or [])
+            if sender:
+                members.add(sender)
+                group["members"] = sorted(members)
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            self.bubble(payload, False, msg_id, source="live")
+
+    def group_history(self, group_id, messages):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        if self.current_chat_kind != "group" or self.current_group_id != gid:
+            return
+        self.clear_chat()
+        for m in messages:
+            sender = m.get("sender")
+            self.bubble(m.get("payload"), sender == self.username, m.get("id"), source="history")
+        group = self.group_chats.get(gid)
+        if isinstance(group, dict):
+            members = set(group.get("members") or [])
+            for m in messages:
+                sender = m.get("sender")
+                if sender:
+                    members.add(sender)
+            group["members"] = sorted(members)
+
+    def on_groups(self, groups):
+        seen = set()
+        for group in groups or []:
+            gid = self._normalize_group_id(group.get("group_id") if isinstance(group, dict) else None)
+            if gid is None:
+                continue
+            self._upsert_group(group)
+            seen.add(gid)
+        stale = [gid for gid in list(self.group_chats.keys()) if gid not in seen]
+        for gid in stale:
+            self._remove_group(gid)
+
+    def on_group_created(self, group):
+        if not isinstance(group, dict):
+            return
+        select = bool(group.get("owner") == self.username and self.current_chat_kind != "group")
+        self._upsert_group(group, select=select)
+
+    def on_group_invites(self, invites):
+        for invite in invites or []:
+            if isinstance(invite, dict):
+                self.on_group_invite(invite)
+
+    def on_group_invite(self, invite):
+        if not isinstance(invite, dict):
+            return
+        invite_id = self._normalize_group_id(invite.get("invite_id"))
+        if invite_id is None:
+            return
+
+        merged = dict(self.pending_group_invites.get(invite_id) or {})
+        merged.update(invite)
+        if merged.get("_prompted"):
+            self.pending_group_invites[invite_id] = merged
+            return
+        merged["_prompted"] = True
+        self.pending_group_invites[invite_id] = merged
+
+        group_name = merged.get("group_name") or f"Group {merged.get('group_id')}"
+        inviter = merged.get("invited_by") or "unknown"
+        reply = QMessageBox.question(
+            self,
+            "Group Invite",
+            f"{inviter} invited you to join '{group_name}'.\nAccept?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        accepted = reply == QMessageBox.StandardButton.Yes
+        self.net.respond_group_invite(invite_id, accepted)
+        if not accepted:
+            self.pending_group_invites.pop(invite_id, None)
+
+    def on_group_invite_sent(self, event):
+        if not isinstance(event, dict):
+            return
+        username = str(event.get("username") or "").strip()
+        if not username:
+            return
+        QMessageBox.information(self, "Group Invite", f"Invite sent to {username}.")
+
+    def on_group_invite_response(self, event):
+        if not isinstance(event, dict):
+            return
+        invite_id = self._normalize_group_id(event.get("invite_id"))
+        if invite_id is not None:
+            self.pending_group_invites.pop(invite_id, None)
+        if event.get("accepted"):
+            self.net.request_groups()
+        else:
+            QMessageBox.information(self, "Group Invite", "Invite declined.")
+
+    def on_group_invite_result(self, event):
+        if not isinstance(event, dict):
+            return
+        username = event.get("username") or "User"
+        accepted = bool(event.get("accepted"))
+        group_id = self._normalize_group_id(event.get("group_id"))
+        if accepted:
+            QMessageBox.information(self, "Group Invite", f"{username} joined group {group_id}.")
+            self.net.request_groups()
+        else:
+            QMessageBox.information(self, "Group Invite", f"{username} declined the invitation.")
+
+    def on_group_member_added(self, event):
+        if not isinstance(event, dict):
+            return
+        gid = self._normalize_group_id(event.get("group_id"))
+        username = str(event.get("username") or "").strip()
+        if gid is None or not username:
+            return
+        group = self.group_chats.get(gid)
+        if isinstance(group, dict):
+            members = set(group.get("members") or [])
+            members.add(username)
+            group["members"] = sorted(members)
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            self.bubble(f"[System] {username} joined the group.", False, None, source="live")
+        self.net.request_groups()
+
+    def on_group_member_left(self, event):
+        if not isinstance(event, dict):
+            return
+        gid = self._normalize_group_id(event.get("group_id"))
+        username = str(event.get("username") or "").strip()
+        if gid is None or not username:
+            return
+        group = self.group_chats.get(gid)
+        if isinstance(group, dict):
+            members = set(group.get("members") or [])
+            members.discard(username)
+            group["members"] = sorted(members)
+            new_owner = event.get("new_owner")
+            if new_owner:
+                group["owner"] = new_owner
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            self.bubble(f"[System] {username} left the group.", False, None, source="live")
+        self.net.request_groups()
+
+    def on_group_left(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        self._remove_group(gid)
+        QMessageBox.information(self, "Group Chat", "You left the group.")
+
+    def on_group_error(self, event):
+        if not isinstance(event, dict):
+            return
+        op = event.get("op") or "group"
+        err = event.get("error") or "Unknown group operation error."
+        QMessageBox.warning(self, f"Group Error: {op}", str(err))
 
     def remove_by_id(self, msg_id):
         if msg_id in self.bubbles:
@@ -4076,6 +4585,7 @@ class App:
 
         self.signals = Signals()
         self.net = ClientNetwork(self.signals, config_dir=self.profile_dir)
+        self._shown_storage_warnings = set()
 
         self.login_win = LoginWindow(self.net)
         self.login_win.show()
@@ -4091,10 +4601,42 @@ class App:
         self.signals.secure_session_response.connect(self.on_secure_session_response)
         self.signals.secure_session_established.connect(self.on_secure_session_established)
         self.signals.identity_keys.connect(self.on_identity_keys)
+        self.signals.storage_warning.connect(self.on_storage_warning)
         self.signals.history.connect(self.on_history)
+        self.signals.groups.connect(self.on_groups)
+        self.signals.group_created.connect(self.on_group_created)
+        self.signals.group_invites.connect(self.on_group_invites)
+        self.signals.group_invite.connect(self.on_group_invite)
+        self.signals.group_invite_sent.connect(self.on_group_invite_sent)
+        self.signals.group_invite_response.connect(self.on_group_invite_response)
+        self.signals.group_invite_result.connect(self.on_group_invite_result)
+        self.signals.group_member_added.connect(self.on_group_member_added)
+        self.signals.group_member_left.connect(self.on_group_member_left)
+        self.signals.group_message.connect(self.on_group_message)
+        self.signals.group_history.connect(self.on_group_history)
+        self.signals.group_left.connect(self.on_group_left)
+        self.signals.group_error.connect(self.on_group_error)
         self.signals.delete.connect(lambda msg_id: self.chat_win.remove_by_id(msg_id) if self.chat_win else None)
         self.signals.msg_sent.connect(lambda mid, to, payload: self.chat_win.on_msg_sent(mid, to, payload) if self.chat_win else None)
+        self.signals.group_msg_sent.connect(
+            lambda mid, gid, payload: self.chat_win.on_group_msg_sent(mid, gid, payload) if self.chat_win else None
+        )
         self.chat_win = None
+
+    def on_storage_warning(self, message):
+        msg = str(message or "").strip()
+        if not msg or msg in self._shown_storage_warnings:
+            return
+        self._shown_storage_warnings.add(msg)
+        parent = self.chat_win if self.chat_win else self.login_win
+        QMessageBox.warning(
+            parent,
+            "Secure Storage Warning",
+            "Secure local key storage is unavailable. "
+            "Keys/session data are currently kept only in memory for this run.\n\n"
+            "Technical details:\n"
+            f"{msg}"
+        )
 
     def on_secure_session_request(self, peer):
         if self.chat_win:
@@ -4122,6 +4664,58 @@ class App:
             return
         if peer == self.chat_win.peer:
             self.chat_win.history(peer, messages)
+
+    def on_groups(self, groups):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_groups(groups)
+
+    def on_group_created(self, group):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_created(group)
+
+    def on_group_invites(self, invites):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_invites(invites)
+
+    def on_group_invite(self, invite):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_invite(invite)
+
+    def on_group_invite_sent(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_invite_sent(event)
+
+    def on_group_invite_response(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_invite_response(event)
+
+    def on_group_invite_result(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_invite_result(event)
+
+    def on_group_member_added(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_member_added(event)
+
+    def on_group_member_left(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_member_left(event)
+
+    def on_group_message(self, group_id, sender, payload, msg_id):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_message(group_id, sender, payload, msg_id)
+
+    def on_group_history(self, group_id, messages):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.group_history(group_id, messages)
+
+    def on_group_left(self, group_id):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_left(group_id)
+
+    def on_group_error(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_error(event)
 
     def on_register(self, data):
         if data.get("status") == "ok":

@@ -1,1 +1,14 @@
+@echo off
+setlocal
+
+REM === Server endpoint ===
+set CHATPY_SERVER_HOST=34.46.154.216
+set CHATPY_SERVER_PORT=9999
+
+REM === TLS ===
+set CHATPY_TLS_ENABLED=1
+set CHATPY_TLS_MIN_VERSION=1.2
+set CHATPY_TLS_CA_FILE=%~dp0ca.crt
+set CHATPY_TLS_SERVER_NAME=34.46.154.216
+
 python -m client.gui

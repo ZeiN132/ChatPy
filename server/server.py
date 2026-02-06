@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import time
+import base64
 from pathlib import Path
 import ssl
 import mysql.connector
@@ -198,6 +199,60 @@ def ensure_schema():
             INDEX idx_identity_user (username)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_groups (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            group_uuid VARCHAR(48) NOT NULL,
+            name VARCHAR(128) NOT NULL,
+            owner VARCHAR(64) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_group_uuid (group_uuid),
+            INDEX idx_group_owner (owner)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS group_members (
+            group_id INT NOT NULL,
+            username VARCHAR(64) NOT NULL,
+            role VARCHAR(16) NOT NULL DEFAULT 'member',
+            added_by VARCHAR(64) NULL,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (group_id, username),
+            INDEX idx_group_members_user (username)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS group_messages (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            group_id INT NOT NULL,
+            sender VARCHAR(64) NOT NULL,
+            payload MEDIUMTEXT NOT NULL,
+            secure_mode TINYINT(1) DEFAULT 0,
+            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_group_messages_group_ts (group_id, ts)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS group_invites (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            group_id INT NOT NULL,
+            invited_user VARCHAR(64) NOT NULL,
+            invited_by VARCHAR(64) NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            responded_at TIMESTAMP NULL DEFAULT NULL,
+            UNIQUE KEY uq_group_invite (group_id, invited_user),
+            INDEX idx_group_invites_user (invited_user, status)
+        )
+    """)
+    cur.execute("SHOW COLUMNS FROM group_messages LIKE 'payload'")
+    g_row = cur.fetchone()
+    if g_row:
+        g_col_type = str(g_row[1]).lower()
+        if "text" not in g_col_type and "blob" not in g_col_type:
+            cur.execute("ALTER TABLE group_messages MODIFY payload MEDIUMTEXT")
+        elif g_col_type in ("tinytext",):
+            cur.execute("ALTER TABLE group_messages MODIFY payload MEDIUMTEXT")
     conn.commit()
     cur.close()
     conn.close()
@@ -358,6 +413,179 @@ def delete_secure_messages(sender, receiver):
     conn.close()
     return deleted_count
 
+def _new_group_uuid():
+    return base64.urlsafe_b64encode(secrets.token_bytes(9)).decode("ascii").rstrip("=")
+
+
+def _normalize_group_name(raw_name):
+    cleaned = " ".join(str(raw_name or "").split())
+    return cleaned[:128]
+
+
+def _normalize_user_list(raw_users):
+    normalized = []
+    seen = set()
+    if not isinstance(raw_users, list):
+        return normalized
+    for value in raw_users:
+        username = str(value or "").strip()
+        if not username or username in seen:
+            continue
+        seen.add(username)
+        normalized.append(username)
+    return normalized
+
+
+def _parse_group_id(raw_group_id):
+    try:
+        gid = int(raw_group_id)
+    except (TypeError, ValueError):
+        return None
+    return gid if gid > 0 else None
+
+
+def _row_to_group_info(row):
+    if not isinstance(row, dict):
+        return None
+    return {
+        "group_id": row.get("id"),
+        "group_uuid": row.get("group_uuid"),
+        "name": row.get("name"),
+        "owner": row.get("owner"),
+        "role": row.get("role") or "member",
+        "member_count": int(row.get("member_count") or 0),
+    }
+
+
+def get_user_groups(username):
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT
+            g.id,
+            g.group_uuid,
+            g.name,
+            g.owner,
+            gm.role,
+            (
+                SELECT COUNT(*)
+                FROM group_members gm2
+                WHERE gm2.group_id = g.id
+            ) AS member_count
+        FROM chat_groups g
+        JOIN group_members gm ON gm.group_id = g.id
+        WHERE gm.username = %s
+        ORDER BY g.created_at DESC, g.id DESC
+    """, (username,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    groups = []
+    for row in rows:
+        info = _row_to_group_info(row)
+        if info:
+            groups.append(info)
+    return groups
+
+
+def get_group_info_for_user(group_id, username):
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT
+            g.id,
+            g.group_uuid,
+            g.name,
+            g.owner,
+            gm.role,
+            (
+                SELECT COUNT(*)
+                FROM group_members gm2
+                WHERE gm2.group_id = g.id
+            ) AS member_count
+        FROM chat_groups g
+        JOIN group_members gm ON gm.group_id = g.id
+        WHERE g.id = %s AND gm.username = %s
+        LIMIT 1
+    """, (group_id, username))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return _row_to_group_info(row) if row else None
+
+
+def get_group_members(group_id):
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT username
+        FROM group_members
+        WHERE group_id = %s
+    """, (group_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [r["username"] for r in rows if r.get("username")]
+
+
+def is_group_member(username, group_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1
+        FROM group_members
+        WHERE group_id = %s AND username = %s
+        LIMIT 1
+    """, (group_id, username))
+    exists = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return exists
+
+
+def get_pending_group_invites(username):
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT
+            gi.id,
+            gi.group_id,
+            g.group_uuid,
+            g.name AS group_name,
+            gi.invited_by
+        FROM group_invites gi
+        JOIN chat_groups g ON g.id = gi.group_id
+        WHERE gi.invited_user = %s AND gi.status = 'pending'
+        ORDER BY gi.created_at ASC, gi.id ASC
+    """, (username,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    invites = []
+    for row in rows:
+        invites.append({
+            "invite_id": row.get("id"),
+            "group_id": row.get("group_id"),
+            "group_uuid": row.get("group_uuid"),
+            "group_name": row.get("group_name"),
+            "invited_by": row.get("invited_by"),
+        })
+    return invites
+
+
+async def push_group_snapshot(username, writer):
+    await safe_write(writer, {
+        "type": "groups",
+        "groups": get_user_groups(username)
+    })
+    invites = get_pending_group_invites(username)
+    if invites:
+        await safe_write(writer, {
+            "type": "group_invites",
+            "invites": invites
+        })
+
+
 # ----------------- SERVER -----------------
 clients = {}  # username -> writer
 
@@ -457,6 +685,7 @@ async def handle_client(reader, writer):
                             "is_decoy": False,
                             "recovery_set": bool(phrase_hash)
                         })
+                        await push_group_snapshot(username, writer)
                 cur.close()
                 conn.close()
 
@@ -538,6 +767,7 @@ async def handle_client(reader, writer):
 
                         except Exception as e:
                             print(f"[ERROR] Failed to process message {msg_data['id']}: {e}")
+                    await push_group_snapshot(user, writer)
                 finally:
                     cur.close()
                     conn.close()
@@ -692,6 +922,559 @@ async def handle_client(reader, writer):
             # ---------- GET USERS ----------
             elif mtype == "get_users" and user:
                 await safe_write(writer, {"type": "all_users", "users": get_all_users()})
+
+            # ---------- GET GROUPS ----------
+            elif mtype == "get_groups" and user:
+                await safe_write(writer, {
+                    "type": "groups",
+                    "groups": get_user_groups(user)
+                })
+
+            # ---------- GET GROUP INVITES ----------
+            elif mtype == "get_group_invites" and user:
+                await safe_write(writer, {
+                    "type": "group_invites",
+                    "invites": get_pending_group_invites(user)
+                })
+
+            # ---------- CREATE GROUP ----------
+            elif mtype == "create_group" and user:
+                group_name = _normalize_group_name(msg.get("name"))
+                members = [u for u in _normalize_user_list(msg.get("members")) if u != user]
+
+                if not group_name:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "create_group",
+                        "error": "Group name is required"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                invite_events = []
+                group_id = None
+                group_uuid = None
+                try:
+                    if members:
+                        placeholders = ", ".join(["%s"] * len(members))
+                        cur.execute(
+                            f"SELECT username FROM users WHERE username IN ({placeholders})",
+                            tuple(members)
+                        )
+                        found = {r["username"] for r in cur.fetchall()}
+                        missing = [u for u in members if u not in found]
+                        if missing:
+                            await safe_write(writer, {
+                                "type": "group_error",
+                                "op": "create_group",
+                                "error": f"Unknown users: {', '.join(missing)}"
+                            })
+                            continue
+
+                    group_uuid = _new_group_uuid()
+                    cur.execute("""
+                        INSERT INTO chat_groups (group_uuid, name, owner)
+                        VALUES (%s, %s, %s)
+                    """, (group_uuid, group_name, user))
+                    group_id = cur.lastrowid
+
+                    cur.execute("""
+                        INSERT INTO group_members (group_id, username, role, added_by)
+                        VALUES (%s, %s, 'owner', %s)
+                    """, (group_id, user, user))
+
+                    for invited_user in members:
+                        cur.execute("""
+                            INSERT INTO group_invites (group_id, invited_user, invited_by, status)
+                            VALUES (%s, %s, %s, 'pending')
+                        """, (group_id, invited_user, user))
+                        invite_events.append({
+                            "invite_id": cur.lastrowid,
+                            "group_id": group_id,
+                            "group_uuid": group_uuid,
+                            "group_name": group_name,
+                            "invited_by": user,
+                            "invited_user": invited_user
+                        })
+
+                    conn.commit()
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP CREATE ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "create_group",
+                        "error": "Failed to create group"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                group_info = get_group_info_for_user(group_id, user)
+                if group_info:
+                    await safe_write(writer, {
+                        "type": "group_created",
+                        "group": group_info
+                    })
+
+                for invite in invite_events:
+                    invited_user = invite.get("invited_user")
+                    if invited_user in clients:
+                        await safe_write(clients[invited_user], {
+                            "type": "group_invite",
+                            "invite": {
+                                "invite_id": invite.get("invite_id"),
+                                "group_id": invite.get("group_id"),
+                                "group_uuid": invite.get("group_uuid"),
+                                "group_name": invite.get("group_name"),
+                                "invited_by": invite.get("invited_by")
+                            }
+                        })
+
+            # ---------- INVITE GROUP MEMBER ----------
+            elif mtype == "invite_group_member" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                invited_user = str(msg.get("username") or "").strip()
+                if not group_id or not invited_user:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "invite_group_member",
+                        "error": "group_id and username are required"
+                    })
+                    continue
+                if invited_user == user:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "invite_group_member",
+                        "error": "You are already in this group"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                invite_id = None
+                group_uuid = None
+                group_name = None
+                try:
+                    cur.execute("""
+                        SELECT g.group_uuid, g.name
+                        FROM chat_groups g
+                        JOIN group_members gm ON gm.group_id = g.id
+                        WHERE g.id = %s AND gm.username = %s
+                        LIMIT 1
+                    """, (group_id, user))
+                    group_row = cur.fetchone()
+                    if not group_row:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "invite_group_member",
+                            "error": "You are not a member of this group"
+                        })
+                        continue
+                    group_uuid = group_row.get("group_uuid")
+                    group_name = group_row.get("name")
+
+                    cur.execute("SELECT username FROM users WHERE username = %s LIMIT 1", (invited_user,))
+                    if not cur.fetchone():
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "invite_group_member",
+                            "error": "User does not exist"
+                        })
+                        continue
+
+                    cur.execute("""
+                        SELECT 1
+                        FROM group_members
+                        WHERE group_id = %s AND username = %s
+                        LIMIT 1
+                    """, (group_id, invited_user))
+                    if cur.fetchone():
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "invite_group_member",
+                            "error": "User is already a member"
+                        })
+                        continue
+
+                    cur.execute("""
+                        SELECT id, status
+                        FROM group_invites
+                        WHERE group_id = %s AND invited_user = %s
+                        LIMIT 1
+                    """, (group_id, invited_user))
+                    invite_row = cur.fetchone()
+                    if invite_row and invite_row.get("status") == "pending":
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "invite_group_member",
+                            "error": "Invite already pending"
+                        })
+                        continue
+
+                    if invite_row:
+                        invite_id = int(invite_row.get("id"))
+                        cur.execute("""
+                            UPDATE group_invites
+                            SET invited_by = %s, status = 'pending', responded_at = NULL, created_at = NOW()
+                            WHERE id = %s
+                        """, (user, invite_id))
+                    else:
+                        cur.execute("""
+                            INSERT INTO group_invites (group_id, invited_user, invited_by, status)
+                            VALUES (%s, %s, %s, 'pending')
+                        """, (group_id, invited_user, user))
+                        invite_id = cur.lastrowid
+
+                    conn.commit()
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP INVITE ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "invite_group_member",
+                        "error": "Failed to create invite"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                await safe_write(writer, {
+                    "type": "group_invite_sent",
+                    "group_id": group_id,
+                    "username": invited_user
+                })
+                if invited_user in clients:
+                    await safe_write(clients[invited_user], {
+                        "type": "group_invite",
+                        "invite": {
+                            "invite_id": invite_id,
+                            "group_id": group_id,
+                            "group_uuid": group_uuid,
+                            "group_name": group_name,
+                            "invited_by": user
+                        }
+                    })
+
+            # ---------- RESPOND GROUP INVITE ----------
+            elif mtype == "respond_group_invite" and user:
+                invite_id = _parse_group_id(msg.get("invite_id"))
+                accepted = bool(msg.get("accept"))
+                if not invite_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "respond_group_invite",
+                        "error": "invite_id is required"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                group_id = None
+                invited_by = None
+                try:
+                    cur.execute("""
+                        SELECT
+                            gi.id,
+                            gi.group_id,
+                            gi.invited_by
+                        FROM group_invites gi
+                        WHERE gi.id = %s AND gi.invited_user = %s AND gi.status = 'pending'
+                        LIMIT 1
+                    """, (invite_id, user))
+                    invite = cur.fetchone()
+                    if not invite:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "respond_group_invite",
+                            "error": "Invite not found or already handled"
+                        })
+                        continue
+
+                    group_id = int(invite.get("group_id"))
+                    invited_by = invite.get("invited_by")
+
+                    if accepted:
+                        cur.execute("""
+                            INSERT INTO group_members (group_id, username, role, added_by)
+                            VALUES (%s, %s, 'member', %s)
+                            ON DUPLICATE KEY UPDATE role = VALUES(role)
+                        """, (group_id, user, invited_by))
+                        cur.execute("""
+                            UPDATE group_invites
+                            SET status = 'accepted', responded_at = NOW()
+                            WHERE id = %s
+                        """, (invite_id,))
+                    else:
+                        cur.execute("""
+                            UPDATE group_invites
+                            SET status = 'declined', responded_at = NOW()
+                            WHERE id = %s
+                        """, (invite_id,))
+
+                    conn.commit()
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP INVITE RESPONSE ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "respond_group_invite",
+                        "error": "Failed to process invite response"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                await safe_write(writer, {
+                    "type": "group_invite_response",
+                    "invite_id": invite_id,
+                    "group_id": group_id,
+                    "accepted": accepted
+                })
+
+                if accepted:
+                    group_info = get_group_info_for_user(group_id, user)
+                    if group_info:
+                        await safe_write(writer, {
+                            "type": "group_created",
+                            "group": group_info
+                        })
+
+                    members = get_group_members(group_id)
+                    for member in members:
+                        if member == user:
+                            continue
+                        if member in clients:
+                            await safe_write(clients[member], {
+                                "type": "group_member_added",
+                                "group_id": group_id,
+                                "username": user
+                            })
+
+                if invited_by in clients:
+                    await safe_write(clients[invited_by], {
+                        "type": "group_invite_result",
+                        "invite_id": invite_id,
+                        "group_id": group_id,
+                        "username": user,
+                        "accepted": accepted
+                    })
+
+            # ---------- LEAVE GROUP ----------
+            elif mtype == "leave_group" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                if not group_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "leave_group",
+                        "error": "group_id is required"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                owner_before = None
+                remaining_members = []
+                new_owner = None
+                try:
+                    cur.execute("SELECT owner FROM chat_groups WHERE id = %s LIMIT 1", (group_id,))
+                    group_row = cur.fetchone()
+                    if not group_row:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "leave_group",
+                            "error": "Group not found"
+                        })
+                        continue
+                    owner_before = group_row.get("owner")
+
+                    cur.execute("""
+                        SELECT role
+                        FROM group_members
+                        WHERE group_id = %s AND username = %s
+                        LIMIT 1
+                    """, (group_id, user))
+                    if not cur.fetchone():
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "leave_group",
+                            "error": "You are not a member of this group"
+                        })
+                        continue
+
+                    cur.execute("""
+                        DELETE FROM group_members
+                        WHERE group_id = %s AND username = %s
+                    """, (group_id, user))
+
+                    cur.execute("""
+                        DELETE FROM group_invites
+                        WHERE group_id = %s AND invited_user = %s AND status = 'pending'
+                    """, (group_id, user))
+
+                    cur.execute("""
+                        SELECT username
+                        FROM group_members
+                        WHERE group_id = %s
+                        ORDER BY joined_at ASC
+                    """, (group_id,))
+                    remaining_rows = cur.fetchall()
+                    remaining_members = [r.get("username") for r in remaining_rows if r.get("username")]
+
+                    if not remaining_members:
+                        cur.execute("DELETE FROM group_invites WHERE group_id = %s", (group_id,))
+                        cur.execute("DELETE FROM group_messages WHERE group_id = %s", (group_id,))
+                        cur.execute("DELETE FROM chat_groups WHERE id = %s", (group_id,))
+                    elif owner_before == user:
+                        new_owner = remaining_members[0]
+                        cur.execute("UPDATE chat_groups SET owner = %s WHERE id = %s", (new_owner, group_id))
+                        cur.execute("""
+                            UPDATE group_members
+                            SET role = CASE WHEN username = %s THEN 'owner' ELSE 'member' END
+                            WHERE group_id = %s
+                        """, (new_owner, group_id))
+
+                    conn.commit()
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP LEAVE ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "leave_group",
+                        "error": "Failed to leave group"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                await safe_write(writer, {
+                    "type": "group_left",
+                    "group_id": group_id
+                })
+
+                for member in remaining_members:
+                    if member in clients:
+                        await safe_write(clients[member], {
+                            "type": "group_member_left",
+                            "group_id": group_id,
+                            "username": user,
+                            "new_owner": new_owner
+                        })
+
+            # ---------- GROUP MESSAGE ----------
+            elif mtype == "group_msg" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                payload = msg.get("payload")
+                secure_mode = bool(msg.get("secure_mode", False))
+                if not group_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_msg",
+                        "error": "group_id is required"
+                    })
+                    continue
+                if not is_group_member(user, group_id):
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_msg",
+                        "error": "You are not a member of this group"
+                    })
+                    continue
+
+                payload = _ensure_payload_purpose(payload, secure_mode)
+                payload_str = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+
+                conn = get_db()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        INSERT INTO group_messages (group_id, sender, payload, secure_mode, ts)
+                        VALUES (%s, %s, %s, %s, NOW())
+                    """, (group_id, user, payload_str, 1 if secure_mode else 0))
+                    conn.commit()
+                    new_msg_id = cur.lastrowid
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP MSG ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_msg",
+                        "error": "Failed to send message"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                members = get_group_members(group_id)
+                for member in members:
+                    if member == user:
+                        continue
+                    if member in clients:
+                        await safe_write(clients[member], {
+                            "type": "group_msg",
+                            "group_id": group_id,
+                            "from": user,
+                            "payload": payload,
+                            "id": new_msg_id,
+                            "secure_mode": secure_mode
+                        })
+
+                await safe_write(writer, {
+                    "type": "group_msg_sent",
+                    "group_id": group_id,
+                    "id": new_msg_id,
+                    "payload": payload,
+                    "secure_mode": secure_mode
+                })
+
+            # ---------- GROUP HISTORY ----------
+            elif mtype == "get_group_history" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                if not group_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_history",
+                        "error": "group_id is required"
+                    })
+                    continue
+                if not is_group_member(user, group_id):
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_history",
+                        "error": "You are not a member of this group"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                cur.execute("""
+                    SELECT id, sender, payload, secure_mode
+                    FROM group_messages
+                    WHERE group_id = %s
+                    ORDER BY ts
+                """, (group_id,))
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+
+                for row in rows:
+                    try:
+                        row["payload"] = json.loads(row["payload"])
+                    except Exception:
+                        pass
+                    row["payload"] = _ensure_payload_purpose(row["payload"], row.get("secure_mode", 0) == 1)
+
+                await safe_write(writer, {
+                    "type": "group_history",
+                    "group_id": group_id,
+                    "messages": rows
+                })
 
             # ---------- SECURE SESSION REQUEST ----------
             elif mtype == "secure_session_request" and user:

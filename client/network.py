@@ -67,13 +67,30 @@ class ClientNetwork:
         self._normal_replay_max_epochs = 8
         self._normal_replay_max_ids = 4096
         self.config_dir = config_dir or ".chat_config"
-        self.identity_mgr = IdentityKeyManager(config_dir=self.config_dir)
+        self.identity_mgr = IdentityKeyManager(
+            config_dir=self.config_dir,
+            warning_callback=self._notify_storage_warning,
+        )
         self.identity = None
         self.peer_identities = {}
-        self.identity_pins = IdentityPinStore(config_dir=self.config_dir)
-        self.normal_store = NormalSessionStore(config_dir=self.config_dir)
+        self.identity_pins = IdentityPinStore(
+            config_dir=self.config_dir,
+            warning_callback=self._notify_storage_warning,
+        )
+        self.normal_store = NormalSessionStore(
+            config_dir=self.config_dir,
+            warning_callback=self._notify_storage_warning,
+        )
         self.username = None
         self._rekey_after = 100
+
+    def _notify_storage_warning(self, message):
+        if not message:
+            return
+        try:
+            self.signals.storage_warning.emit(str(message))
+        except Exception:
+            pass
 
     def connect(self):
         if self.connected and self.sock is not None and self.file is not None:
@@ -219,6 +236,103 @@ class ClientNetwork:
                 
                 elif msg_type == "history":
                     self.signals.history.emit(msg["with"], msg["messages"])
+
+                elif msg_type == "groups":
+                    try:
+                        self.signals.groups.emit(msg.get("groups", []))
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_created":
+                    try:
+                        self.signals.group_created.emit(msg.get("group", {}))
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_invites":
+                    invites = msg.get("invites", [])
+                    try:
+                        self.signals.group_invites.emit(invites if isinstance(invites, list) else [])
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_invite":
+                    try:
+                        self.signals.group_invite.emit(msg.get("invite", {}))
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_invite_sent":
+                    try:
+                        self.signals.group_invite_sent.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_invite_response":
+                    try:
+                        self.signals.group_invite_response.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_invite_result":
+                    try:
+                        self.signals.group_invite_result.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_member_added":
+                    try:
+                        self.signals.group_member_added.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_member_left":
+                    try:
+                        self.signals.group_member_left.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_msg":
+                    try:
+                        self.signals.group_message.emit(
+                            msg.get("group_id"),
+                            msg.get("from"),
+                            msg.get("payload"),
+                            msg.get("id")
+                        )
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_msg_sent":
+                    try:
+                        self.signals.group_msg_sent.emit(
+                            msg.get("id"),
+                            msg.get("group_id"),
+                            msg.get("payload")
+                        )
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_history":
+                    try:
+                        self.signals.group_history.emit(
+                            msg.get("group_id"),
+                            msg.get("messages", [])
+                        )
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_left":
+                    try:
+                        self.signals.group_left.emit(msg.get("group_id"))
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_error":
+                    try:
+                        self.signals.group_error.emit(msg)
+                    except Exception:
+                        pass
         except Exception as e:
             print("[READER ERROR]", e)
         finally:
@@ -1158,6 +1272,53 @@ class ClientNetwork:
 
     def request_users(self):
         self.send({"type": "get_users"})
+
+    def request_groups(self):
+        self.send({"type": "get_groups"})
+
+    def request_group_invites(self):
+        self.send({"type": "get_group_invites"})
+
+    def create_group(self, name, members):
+        self.send({
+            "type": "create_group",
+            "name": name,
+            "members": members if isinstance(members, list) else []
+        })
+
+    def invite_group_member(self, group_id, username):
+        self.send({
+            "type": "invite_group_member",
+            "group_id": group_id,
+            "username": username
+        })
+
+    def respond_group_invite(self, invite_id, accept):
+        self.send({
+            "type": "respond_group_invite",
+            "invite_id": invite_id,
+            "accept": bool(accept)
+        })
+
+    def leave_group(self, group_id):
+        self.send({
+            "type": "leave_group",
+            "group_id": group_id
+        })
+
+    def request_group_history(self, group_id):
+        self.send({
+            "type": "get_group_history",
+            "group_id": group_id
+        })
+
+    def send_group_message(self, group_id, text, secure_mode=False):
+        self.send({
+            "type": "group_msg",
+            "group_id": group_id,
+            "payload": text,
+            "secure_mode": bool(secure_mode)
+        })
 
     def request_history(self, peer):
         self.send({"type": "get_history", "with": peer})

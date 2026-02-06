@@ -12,6 +12,14 @@ from keyring.errors import NoKeyringError
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives import serialization
 
+_ALLOW_PLAINTEXT_KEYSTORE_ENV = "CHATPY_ALLOW_PLAINTEXT_KEYSTORE"
+
+
+def _env_truthy(value):
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
 
 class _KeyringStore:
     def __init__(self, service="secure_chat"):
@@ -50,6 +58,7 @@ class _DPAPIStore:
 
     def __init__(self, path):
         self.path = Path(path)
+        self._allow_plaintext = _env_truthy(os.getenv(_ALLOW_PLAINTEXT_KEYSTORE_ENV))
         self._crypt32 = None
         self._kernel32 = None
         if os.name == "nt":
@@ -143,7 +152,16 @@ class _DPAPIStore:
                 return {}
 
         if isinstance(data, dict):
-            return data
+            if self._allow_plaintext:
+                return data
+            if self._crypt32:
+                # Best-effort migration of legacy plaintext JSON to DPAPI wrapper.
+                self.save(data)
+                return data
+            raise RuntimeError(
+                "Plaintext key storage is blocked. "
+                f"Enable keyring/DPAPI or set {_ALLOW_PLAINTEXT_KEYSTORE_ENV}=1 for legacy mode."
+            )
         return {}
 
     def save(self, data):
@@ -156,7 +174,13 @@ class _DPAPIStore:
             }
             self.path.write_text(json.dumps(wrapper, ensure_ascii=True), encoding="utf-8")
             return
-        self.path.write_text(json.dumps(data, ensure_ascii=True), encoding="utf-8")
+        if self._allow_plaintext:
+            self.path.write_text(json.dumps(data, ensure_ascii=True), encoding="utf-8")
+            return
+        raise RuntimeError(
+            "Secure local key storage is unavailable. "
+            f"Enable keyring/DPAPI or set {_ALLOW_PLAINTEXT_KEYSTORE_ENV}=1 for legacy mode."
+        )
 
 
 def _b64e(data):
@@ -164,15 +188,33 @@ def _b64e(data):
 
 
 class IdentityKeyManager:
-    def __init__(self, config_dir=".chat_config", service="secure_chat"):
+    def __init__(self, config_dir=".chat_config", service="secure_chat", warning_callback=None):
         self.config_dir = Path(config_dir)
         self.config_dir.mkdir(exist_ok=True)
+        self._volatile = {}
+        self._storage_warning_emitted = False
+        self._warning_callback = warning_callback
         self._keyring = None
         try:
             self._keyring = _KeyringStore(service)
         except Exception:
             self._keyring = None
         self._dpapi = _DPAPIStore(self.config_dir / "identity_keys.json")
+
+    def _warn_storage_issue(self, action, err):
+        if self._storage_warning_emitted:
+            return
+        self._storage_warning_emitted = True
+        message = (
+            f"[IDENTITY][WARN] Secure key persistence disabled ({action} failed: {err}). "
+            "Using volatile in-memory storage for this session."
+        )
+        print(message)
+        if callable(self._warning_callback):
+            try:
+                self._warning_callback(message)
+            except Exception:
+                pass
 
     def _get(self, key):
         if self._keyring:
@@ -182,7 +224,11 @@ class IdentityKeyManager:
                     return data
             except Exception:
                 pass
-        data = self._dpapi.load()
+        try:
+            data = self._dpapi.load()
+        except RuntimeError as e:
+            self._warn_storage_issue("load", e)
+            data = self._volatile
         return data.get(key)
 
     def _set(self, key, data):
@@ -192,9 +238,17 @@ class IdentityKeyManager:
                 return
             except Exception:
                 pass
-        store = self._dpapi.load()
+        try:
+            store = self._dpapi.load()
+        except RuntimeError as e:
+            self._warn_storage_issue("load", e)
+            store = dict(self._volatile)
         store[key] = data
-        self._dpapi.save(store)
+        self._volatile = dict(store)
+        try:
+            self._dpapi.save(store)
+        except RuntimeError as e:
+            self._warn_storage_issue("save", e)
 
     def get_device_id(self):
         entry = self._get("identity:device_id")
@@ -260,9 +314,12 @@ def fingerprint_ed25519_pub(pub_b64):
 
 
 class IdentityPinStore:
-    def __init__(self, config_dir=".chat_config", service="secure_chat"):
+    def __init__(self, config_dir=".chat_config", service="secure_chat", warning_callback=None):
         self.config_dir = Path(config_dir)
         self.config_dir.mkdir(exist_ok=True)
+        self._volatile = {}
+        self._storage_warning_emitted = False
+        self._warning_callback = warning_callback
         self._keyring = None
         try:
             self._keyring = _KeyringStore(service)
@@ -270,6 +327,21 @@ class IdentityPinStore:
             self._keyring = None
         self._dpapi = _DPAPIStore(self.config_dir / "identity_pins.json")
         self._store_key = "identity:pins"
+
+    def _warn_storage_issue(self, action, err):
+        if self._storage_warning_emitted:
+            return
+        self._storage_warning_emitted = True
+        message = (
+            f"[IDENTITY][WARN] Secure pin persistence disabled ({action} failed: {err}). "
+            "Using volatile in-memory storage for this session."
+        )
+        print(message)
+        if callable(self._warning_callback):
+            try:
+                self._warning_callback(message)
+            except Exception:
+                pass
 
     def _load_all(self):
         data = None
@@ -279,7 +351,11 @@ class IdentityPinStore:
             except Exception:
                 data = None
         if data is None:
-            data = self._dpapi.load()
+            try:
+                data = self._dpapi.load()
+            except RuntimeError as e:
+                self._warn_storage_issue("load", e)
+                data = self._volatile
         if isinstance(data, dict):
             return data
         return {}
@@ -293,7 +369,11 @@ class IdentityPinStore:
                 return
             except Exception:
                 pass
-        self._dpapi.save(data)
+        self._volatile = dict(data)
+        try:
+            self._dpapi.save(data)
+        except RuntimeError as e:
+            self._warn_storage_issue("save", e)
 
     def get_peer(self, peer):
         data = self._load_all()
@@ -351,9 +431,12 @@ class IdentityPinStore:
 
 
 class NormalSessionStore:
-    def __init__(self, config_dir=".chat_config", service="secure_chat"):
+    def __init__(self, config_dir=".chat_config", service="secure_chat", warning_callback=None):
         self.config_dir = Path(config_dir)
         self.config_dir.mkdir(exist_ok=True)
+        self._volatile = {}
+        self._storage_warning_emitted = False
+        self._warning_callback = warning_callback
         self._keyring = None
         try:
             self._keyring = _KeyringStore(service)
@@ -361,6 +444,21 @@ class NormalSessionStore:
             self._keyring = None
         self._dpapi = _DPAPIStore(self.config_dir / "normal_sessions.json")
         self._store_key = "normal:sessions"
+
+    def _warn_storage_issue(self, action, err):
+        if self._storage_warning_emitted:
+            return
+        self._storage_warning_emitted = True
+        message = (
+            f"[SESSION][WARN] Secure session persistence disabled ({action} failed: {err}). "
+            "Using volatile in-memory storage for this session."
+        )
+        print(message)
+        if callable(self._warning_callback):
+            try:
+                self._warning_callback(message)
+            except Exception:
+                pass
 
     def _load_all(self):
         data = None
@@ -370,7 +468,11 @@ class NormalSessionStore:
             except Exception:
                 data = None
         if data is None:
-            data = self._dpapi.load()
+            try:
+                data = self._dpapi.load()
+            except RuntimeError as e:
+                self._warn_storage_issue("load", e)
+                data = self._volatile
         if isinstance(data, dict):
             return data
         return {}
@@ -384,7 +486,11 @@ class NormalSessionStore:
                 return
             except Exception:
                 pass
-        self._dpapi.save(data)
+        self._volatile = dict(data)
+        try:
+            self._dpapi.save(data)
+        except RuntimeError as e:
+            self._warn_storage_issue("save", e)
 
     def _load_user(self, username):
         data = self._load_all()
