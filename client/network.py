@@ -345,6 +345,14 @@ class ClientNetwork:
                     except Exception:
                         pass
 
+                elif msg_type == "group_deleted":
+                    try:
+                        group_id = msg.get("group_id")
+                        self.clear_group_session(group_id)
+                        self.signals.group_deleted.emit(msg)
+                    except Exception:
+                        pass
+
                 elif msg_type == "group_key_update":
                     try:
                         self.set_group_key(
@@ -1481,6 +1489,12 @@ class ClientNetwork:
     def leave_group(self, group_id):
         self.send({
             "type": "leave_group",
+            "group_id": group_id
+        })
+
+    def delete_group(self, group_id):
+        self.send({
+            "type": "delete_group",
             "group_id": group_id
         })
 

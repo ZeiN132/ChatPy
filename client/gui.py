@@ -2019,6 +2019,7 @@ class Signals(QObject):
     group_msg_sent = pyqtSignal(object, object, object)
     group_history = pyqtSignal(object, list)
     group_left = pyqtSignal(object)
+    group_deleted = pyqtSignal(dict)
     group_error = pyqtSignal(dict)
     group_key_update = pyqtSignal(dict)
 
@@ -2744,6 +2745,25 @@ class ChatWindow(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         self.net.leave_group(gid)
+
+    def delete_group(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        group = self.group_chats.get(gid, {})
+        if str(group.get("owner") or "") != self.username:
+            QMessageBox.warning(self, "Group Chat", "Only group owner can delete this group.")
+            return
+        group_name = group.get("name") or f"Group {gid}"
+        reply = QMessageBox.question(
+            self,
+            "Delete Group",
+            f"Delete group '{group_name}' for all members?\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.net.delete_group(gid)
 
     def _normalize_group_id(self, value):
         try:
@@ -3948,7 +3968,11 @@ class ChatWindow(QWidget):
             kind = self._item_kind(item) or "peer"
             if kind == "group":
                 group_id = self._item_group_id(item)
+                group = self.group_chats.get(group_id, {})
+                is_owner = str(group.get("owner") or "") == self.username
                 menu.addAction("Invite member", lambda gid=group_id: self.invite_member_to_group(gid))
+                if is_owner:
+                    menu.addAction("Delete group", lambda gid=group_id: self.delete_group(gid))
                 menu.addAction("Leave group", lambda gid=group_id: self.leave_group(gid))
             else:
                 peer = self._item_contact(item) or item.text()
@@ -4082,7 +4106,7 @@ class ChatWindow(QWidget):
         if self.current_chat_kind == "group" and self.current_group_id == gid:
             decoded = self._decode_group_payload(gid, payload, source="sent")
             if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
-                self._handle_group_file_chunk(gid, self.username, decoded, True, source="sent")
+                # Outgoing group file is already rendered locally in _send_group_file_in_chunks.
                 return
             self.bubble(decoded, True, msg_id, source="sent")
 
@@ -4258,6 +4282,29 @@ class ChatWindow(QWidget):
             return
         self._remove_group(gid)
         QMessageBox.information(self, "Group Chat", "You left the group.")
+
+    def on_group_deleted(self, event):
+        if not isinstance(event, dict):
+            return
+        gid = self._normalize_group_id(event.get("group_id"))
+        if gid is None:
+            return
+        group = self.group_chats.get(gid) or {}
+        group_name = group.get("name") or f"Group {gid}"
+        deleted_by = str(event.get("deleted_by") or "").strip()
+        self._remove_group(gid)
+        if deleted_by and deleted_by != self.username:
+            QMessageBox.information(
+                self,
+                "Group Chat",
+                f"Group '{group_name}' was deleted by {deleted_by}."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Group Chat",
+                f"Group '{group_name}' was deleted."
+            )
 
     def on_group_error(self, event):
         if not isinstance(event, dict):
@@ -4822,6 +4869,7 @@ class App:
         self.signals.group_message.connect(self.on_group_message)
         self.signals.group_history.connect(self.on_group_history)
         self.signals.group_left.connect(self.on_group_left)
+        self.signals.group_deleted.connect(self.on_group_deleted)
         self.signals.group_error.connect(self.on_group_error)
         self.signals.group_key_update.connect(self.on_group_key_update)
         self.signals.delete.connect(lambda msg_id: self.chat_win.remove_by_id(msg_id) if self.chat_win else None)
@@ -4920,6 +4968,10 @@ class App:
     def on_group_left(self, group_id):
         if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
             self.chat_win.on_group_left(group_id)
+
+    def on_group_deleted(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_deleted(event)
 
     def on_group_error(self, event):
         if self.chat_win and not getattr(self.chat_win, "is_decoy", False):

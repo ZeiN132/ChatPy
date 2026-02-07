@@ -1453,6 +1453,78 @@ async def handle_client(reader, writer):
                                 "reason": "member_left",
                             })
 
+            # ---------- DELETE GROUP ----------
+            elif mtype == "delete_group" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                if not group_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "delete_group",
+                        "error": "group_id is required"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                members = []
+                try:
+                    cur.execute("""
+                        SELECT owner
+                        FROM chat_groups
+                        WHERE id = %s
+                        LIMIT 1
+                    """, (group_id,))
+                    group_row = cur.fetchone()
+                    if not group_row:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "delete_group",
+                            "error": "Group not found"
+                        })
+                        continue
+                    owner = group_row.get("owner")
+                    if owner != user:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "delete_group",
+                            "error": "Only group owner can delete this group"
+                        })
+                        continue
+
+                    cur.execute("""
+                        SELECT username
+                        FROM group_members
+                        WHERE group_id = %s
+                    """, (group_id,))
+                    rows = cur.fetchall()
+                    members = [r.get("username") for r in rows if r.get("username")]
+
+                    cur.execute("DELETE FROM group_invites WHERE group_id = %s", (group_id,))
+                    cur.execute("DELETE FROM group_messages WHERE group_id = %s", (group_id,))
+                    cur.execute("DELETE FROM group_members WHERE group_id = %s", (group_id,))
+                    cur.execute("DELETE FROM chat_groups WHERE id = %s", (group_id,))
+                    conn.commit()
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP DELETE ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "delete_group",
+                        "error": "Failed to delete group"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                for member in members:
+                    if member in clients:
+                        await safe_write(clients[member], {
+                            "type": "group_deleted",
+                            "group_id": group_id,
+                            "deleted_by": user
+                        })
+
             # ---------- GROUP MESSAGE ----------
             elif mtype == "group_msg" and user:
                 group_id = _parse_group_id(msg.get("group_id"))
