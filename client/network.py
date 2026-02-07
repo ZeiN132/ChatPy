@@ -24,6 +24,7 @@ from .identity_keys import (
     IdentityKeyManager,
     IdentityPinStore,
     NormalSessionStore,
+    GroupSessionStore,
     fingerprint_ed25519_pub,
 )
 
@@ -81,7 +82,12 @@ class ClientNetwork:
             config_dir=self.config_dir,
             warning_callback=self._notify_storage_warning,
         )
+        self.group_store = GroupSessionStore(
+            config_dir=self.config_dir,
+            warning_callback=self._notify_storage_warning,
+        )
         self.username = None
+        self.group_sessions = {}
         self._rekey_after = 100
 
     def _notify_storage_warning(self, message):
@@ -174,7 +180,10 @@ class ClientNetwork:
                         continue
                     # Сохраняем имя пользователя при успешной авторизации
                     if status == "ok" and "username" in msg:
-                        self.username = msg["username"]
+                        new_user = msg["username"]
+                        if self.username != new_user:
+                            self.group_sessions = {}
+                        self.username = new_user
                     self.signals.auth.emit(msg)
                     if "users" in msg:
                         self.signals.users.emit(msg.get("users", []))
@@ -239,13 +248,19 @@ class ClientNetwork:
 
                 elif msg_type == "groups":
                     try:
-                        self.signals.groups.emit(msg.get("groups", []))
+                        groups = msg.get("groups", [])
+                        if isinstance(groups, list):
+                            for group_obj in groups:
+                                self.ingest_group_crypto(group_obj)
+                        self.signals.groups.emit(groups if isinstance(groups, list) else [])
                     except Exception:
                         pass
 
                 elif msg_type == "group_created":
                     try:
-                        self.signals.group_created.emit(msg.get("group", {}))
+                        group_obj = msg.get("group", {})
+                        self.ingest_group_crypto(group_obj)
+                        self.signals.group_created.emit(group_obj if isinstance(group_obj, dict) else {})
                     except Exception:
                         pass
 
@@ -324,7 +339,21 @@ class ClientNetwork:
 
                 elif msg_type == "group_left":
                     try:
-                        self.signals.group_left.emit(msg.get("group_id"))
+                        group_id = msg.get("group_id")
+                        self.clear_group_session(group_id)
+                        self.signals.group_left.emit(group_id)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_key_update":
+                    try:
+                        self.set_group_key(
+                            msg.get("group_id"),
+                            msg.get("key_epoch"),
+                            msg.get("group_key"),
+                            set_current=True,
+                        )
+                        self.signals.group_key_update.emit(msg)
                     except Exception:
                         pass
 
@@ -348,6 +377,155 @@ class ClientNetwork:
         except Exception as e:
             print("[SEND ERROR]", e)
             self.disconnect()
+
+    def _normalize_group_id(self, value):
+        try:
+            gid = int(value)
+        except (TypeError, ValueError):
+            return None
+        return gid if gid > 0 else None
+
+    def _group_aad(self, group_id, epoch_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None or not epoch_id:
+            return None
+        return f"chatpy-group-v1|{gid}|{epoch_id}".encode("utf-8")
+
+    def _ensure_group_session(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return None, None
+        session = self.group_sessions.get(gid)
+        if isinstance(session, dict):
+            return gid, session
+        session = {"current": None, "epochs": {}}
+        if self.username:
+            try:
+                stored = self.group_store.get_group(self.username, gid)
+            except Exception:
+                stored = {"current": None, "epochs": {}}
+            if isinstance(stored, dict):
+                session["current"] = stored.get("current")
+                epochs = stored.get("epochs", {})
+                if isinstance(epochs, dict):
+                    session["epochs"] = dict(epochs)
+        self.group_sessions[gid] = session
+        return gid, session
+
+    def set_group_key(self, group_id, epoch_id, group_key_b64, set_current=True):
+        gid = self._normalize_group_id(group_id)
+        epoch = str(epoch_id or "").strip()
+        if gid is None or not epoch or not group_key_b64:
+            return False
+        try:
+            key_bytes = base64.b64decode(group_key_b64)
+        except Exception:
+            return False
+        if len(key_bytes) != 32:
+            return False
+        _, session = self._ensure_group_session(gid)
+        if not session:
+            return False
+        epochs = session.get("epochs")
+        if not isinstance(epochs, dict):
+            epochs = {}
+        epochs[epoch] = key_bytes
+        session["epochs"] = epochs
+        if set_current:
+            session["current"] = epoch
+        self.group_sessions[gid] = session
+        if self.username:
+            try:
+                self.group_store.set_epoch(self.username, gid, epoch, key_bytes, set_current=set_current)
+            except Exception:
+                pass
+        return True
+
+    def clear_group_session(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+        self.group_sessions.pop(gid, None)
+        if self.username:
+            try:
+                self.group_store.remove_group(self.username, gid)
+            except Exception:
+                pass
+
+    def ingest_group_crypto(self, group_obj):
+        if not isinstance(group_obj, dict):
+            return False
+        return self.set_group_key(
+            group_obj.get("group_id"),
+            group_obj.get("key_epoch"),
+            group_obj.get("group_key"),
+            set_current=True,
+        )
+
+    def encrypt_group_payload(self, group_id, payload_obj):
+        gid, session = self._ensure_group_session(group_id)
+        if gid is None or not session:
+            return None
+        epoch = session.get("current")
+        epochs = session.get("epochs", {})
+        if not epoch and isinstance(epochs, dict) and epochs:
+            epoch = list(epochs.keys())[-1]
+            session["current"] = epoch
+        key_bytes = epochs.get(epoch) if isinstance(epochs, dict) else None
+        if not epoch or not key_bytes:
+            return None
+        aad = self._group_aad(gid, epoch)
+        try:
+            plaintext = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            plaintext = json.dumps({"type": "text", "text": str(payload_obj)}, ensure_ascii=False).encode("utf-8")
+        enc = encrypt_msg(key_bytes, plaintext, aad=aad)
+        return {
+            "purpose": "group_v1",
+            "epoch_id": epoch,
+            "enc": enc,
+        }
+
+    def decrypt_group_payload(self, group_id, payload_obj):
+        if not isinstance(payload_obj, dict) or payload_obj.get("purpose") != "group_v1":
+            return payload_obj
+        gid, session = self._ensure_group_session(group_id)
+        if gid is None or not session:
+            raise RuntimeError("Group key is unavailable")
+        epoch = str(payload_obj.get("epoch_id") or "").strip()
+        enc = payload_obj.get("enc")
+        if not isinstance(enc, dict):
+            raise RuntimeError("Invalid group payload")
+
+        epochs = session.get("epochs", {})
+        if not isinstance(epochs, dict):
+            epochs = {}
+
+        key_bytes = epochs.get(epoch) if epoch else None
+        if key_bytes is None and self.username and epoch:
+            try:
+                key_bytes = self.group_store.get_epoch(self.username, gid, epoch)
+            except Exception:
+                key_bytes = None
+            if key_bytes:
+                epochs[epoch] = key_bytes
+                session["epochs"] = epochs
+                self.group_sessions[gid] = session
+
+        if key_bytes is None:
+            current = session.get("current")
+            key_bytes = epochs.get(current) if current else None
+            if key_bytes is not None:
+                epoch = current
+        if key_bytes is None or not epoch:
+            raise RuntimeError("Group key is unavailable")
+
+        aad = self._group_aad(gid, epoch)
+        plaintext = decrypt_msg(key_bytes, enc, aad=aad)
+        try:
+            return json.loads(plaintext.decode("utf-8"))
+        except Exception:
+            return plaintext.decode("utf-8", errors="replace")
 
     def ensure_identity_keys(self):
         if not self.username:
@@ -1312,11 +1490,11 @@ class ClientNetwork:
             "group_id": group_id
         })
 
-    def send_group_message(self, group_id, text, secure_mode=False):
+    def send_group_message(self, group_id, payload, secure_mode=False):
         self.send({
             "type": "group_msg",
             "group_id": group_id,
-            "payload": text,
+            "payload": payload,
             "secure_mode": bool(secure_mode)
         })
 

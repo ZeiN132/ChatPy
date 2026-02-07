@@ -1278,13 +1278,13 @@ class CustomDeleteDialog(QFrame):
         self.cancel()
 
 class CustomMessageDialog(QFrame):
-    def __init__(self, parent, title, text, buttons=("OK",), callback=None):
+    def __init__(self, parent, title, text, buttons=("OK",), callback=None, width=420, height=220):
         super().__init__(parent)
 
         self.callback = callback
 
         self.setObjectName("ConfirmDialog")
-        self.setFixedSize(420, 220)
+        self.setFixedSize(int(width), int(height))
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
 
         layout = QVBoxLayout(self)
@@ -2020,6 +2020,7 @@ class Signals(QObject):
     group_history = pyqtSignal(object, list)
     group_left = pyqtSignal(object)
     group_error = pyqtSignal(dict)
+    group_key_update = pyqtSignal(dict)
 
 class ChatWindow(QWidget):
     def __init__(self, net, username, dropbox_mgr, config_dir=None):
@@ -2219,12 +2220,16 @@ class ChatWindow(QWidget):
         self.files_tab_btn.setChecked(index == 0)
         self.settings_tab_btn.setChecked(index == 1)
 
-    def show_message(self, title, text, buttons=("OK",), cb=None):
+    def show_message(self, title, text, buttons=("OK",), cb=None, size=None):
+        if isinstance(size, (tuple, list)) and len(size) == 2:
+            dlg_w, dlg_h = int(size[0]), int(size[1])
+        else:
+            dlg_w, dlg_h = 420, 220
         self.overlay.fade_in()
-        dlg = CustomMessageDialog(self.overlay, title, text, buttons, cb)
+        dlg = CustomMessageDialog(self.overlay, title, text, buttons, cb, width=dlg_w, height=dlg_h)
         dlg.move(
-            (self.width()-420)//2,
-            (self.height()-220)//2
+            (self.width()-dlg_w)//2,
+            (self.height()-dlg_h)//2
         )
         dlg.show()
 
@@ -2299,7 +2304,13 @@ class ChatWindow(QWidget):
                 if action == "accept":
                     self.reject_secure_session(peer)
 
-        self.show_message("Verify code", msg, buttons=("Verified", "Cancel"), cb=on_result)
+        self.show_message(
+            "Verify code",
+            msg,
+            buttons=("Verified", "Cancel"),
+            cb=on_result,
+            size=(520, 280),
+        )
         return False
 
     def _ensure_peer_verified(self, peer, action=None):
@@ -3373,15 +3384,18 @@ class ChatWindow(QWidget):
             print(f"[ERROR] Failed to process secure chat closure: {e}")
 
     def send_file_dialog(self):
-        if self.current_chat_kind == "group":
-            QMessageBox.information(self, "Group Chat", "File transfer in group chats is not implemented yet.")
-            return
         path, _ = QFileDialog.getOpenFileName(self, "Select file", "", "All Files (*)")
-        if path and self.peer:
-            fname = os.path.basename(path)
-            with open(path, "rb") as f:
-                file_bytes = f.read()
-
+        if not path:
+            return
+        fname = os.path.basename(path)
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+        if self.current_chat_kind == "group":
+            if self.current_group_id is None:
+                return
+            self._send_group_file_in_chunks(self.current_group_id, fname, file_bytes)
+            return
+        if self.peer:
             self._send_file_in_chunks(fname, file_bytes)
 
     def _send_file_in_chunks(self, filename, file_bytes):
@@ -3420,6 +3434,40 @@ class ChatWindow(QWidget):
                 "enc": encrypted
             }
             self.net.send_message(self.peer, payload, secure_mode=secure_mode)
+
+        self._bubble_file(filename, file_bytes, True)
+
+    def _send_group_file_in_chunks(self, group_id, filename, file_bytes):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return
+
+        file_id = base64.urlsafe_b64encode(os.urandom(9)).decode("ascii").rstrip("=")
+        total = (len(file_bytes) + self._file_chunk_size - 1) // self._file_chunk_size
+        if total <= 0:
+            return
+
+        for idx in range(total):
+            start = idx * self._file_chunk_size
+            end = start + self._file_chunk_size
+            chunk = file_bytes[start:end]
+            payload_obj = {
+                "type": "file_chunk",
+                "file_id": file_id,
+                "name": filename,
+                "idx": idx,
+                "total": total,
+                "data": base64.b64encode(chunk).decode("ascii"),
+            }
+            encrypted_payload = self.net.encrypt_group_payload(gid, payload_obj)
+            if encrypted_payload is None:
+                QMessageBox.warning(
+                    self,
+                    "Group Security",
+                    "Group encryption key is unavailable. Reopen the group chat and try again.",
+                )
+                return
+            self.net.send_group_message(gid, encrypted_payload, secure_mode=True)
 
         self._bubble_file(filename, file_bytes, True)
 
@@ -3485,11 +3533,84 @@ class ChatWindow(QWidget):
             del self._incoming_files[buf_key]
             self._bubble_file(entry["name"], assembled, entry["mine"])
 
-    def _bubble_file(self, file_name, file_bytes, mine):
+    def _handle_group_file_chunk(self, group_id, sender, payload, mine, source="live"):
+        gid = self._normalize_group_id(group_id)
+        if gid is None or not isinstance(payload, dict):
+            return
+        file_id = payload.get("file_id")
+        total = payload.get("total")
+        idx = payload.get("idx")
+        name = payload.get("name")
+        data_b64 = payload.get("data")
+        if not file_id or total is None or idx is None or not name or not data_b64:
+            return
+        try:
+            total_i = int(total)
+            idx_i = int(idx)
+            chunk_bytes = base64.b64decode(data_b64)
+        except Exception:
+            return
+        if total_i <= 0 or idx_i < 0 or idx_i >= total_i:
+            return
+
+        sender_tag = sender if sender else "unknown"
+        buf_key = f"group:{gid}:{sender_tag}:{file_id}"
+        entry = self._incoming_files.get(buf_key)
+        if not entry:
+            entry = {
+                "name": name,
+                "total": total_i,
+                "chunks": {},
+                "received": 0,
+                "mine": mine,
+                "sender": sender,
+            }
+            self._incoming_files[buf_key] = entry
+
+        if idx_i in entry["chunks"]:
+            return
+
+        entry["chunks"][idx_i] = chunk_bytes
+        entry["received"] += 1
+        if entry["received"] < entry["total"]:
+            return
+
+        try:
+            assembled = b"".join(entry["chunks"][i] for i in range(entry["total"]))
+        except Exception:
+            return
+        del self._incoming_files[buf_key]
+        self._bubble_file(
+            entry["name"],
+            assembled,
+            entry["mine"],
+            sender_name=None if entry["mine"] else entry.get("sender"),
+        )
+
+    def _decode_group_payload(self, group_id, payload, source="live"):
+        if isinstance(payload, dict) and payload.get("purpose") == "group_v1":
+            try:
+                decoded = self.net.decrypt_group_payload(group_id, payload)
+            except Exception:
+                return "Group message (decryption failed)"
+        else:
+            decoded = payload
+
+        if isinstance(decoded, dict):
+            msg_type = str(decoded.get("type") or "").strip().lower()
+            if msg_type == "text":
+                return str(decoded.get("text") or "")
+            if msg_type == "file_chunk":
+                return decoded
+        return decoded
+
+    def _bubble_file(self, file_name, file_bytes, mine, sender_name=None):
         widget = QWidget()
         widget.setObjectName("BubbleMine" if mine else "BubblePeer")
         widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         row = QHBoxLayout(widget)
+        row.setContentsMargins(8, 6, 8, 6)
+        row.setSpacing(0)
 
         lbl = None
         if file_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
@@ -3515,11 +3636,29 @@ class ChatWindow(QWidget):
             self.show_context_menu(pos, lbl, None, True, fn, fb)
         )
 
+        bubble_content = lbl
+        show_sender = bool(sender_name) and not mine and self.current_chat_kind == "group"
+        if show_sender:
+            lbl.setObjectName("BubbleTextGroup")
+            wrap = QFrame()
+            wrap.setObjectName("BubbleGroupWrap")
+            wrap.setFrameShape(QFrame.Shape.NoFrame)
+            wrap_layout = QVBoxLayout(wrap)
+            wrap_layout.setContentsMargins(0, 0, 0, 0)
+            wrap_layout.setSpacing(6)
+            sender_lbl = QLabel(str(sender_name))
+            sender_lbl.setObjectName("BubbleSender")
+            sender_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            sender_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            wrap_layout.addWidget(sender_lbl, 0, Qt.AlignmentFlag.AlignLeft)
+            wrap_layout.addWidget(lbl)
+            bubble_content = wrap
+
         if mine:
             row.addStretch()
-            row.addWidget(lbl)
+            row.addWidget(bubble_content)
         else:
-            row.addWidget(lbl)
+            row.addWidget(bubble_content)
             row.addStretch()
 
         align = Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft
@@ -3625,15 +3764,19 @@ class ChatWindow(QWidget):
         else:
             return str(payload)
 
-    def bubble(self, payload, mine, msg_id=None, source="live"):
+    def bubble(self, payload, mine, msg_id=None, source="live", sender_name=None):
         if isinstance(payload, dict) and payload.get("type") == "file_chunk":
             self._handle_file_chunk(payload, mine, source=source)
             return
+        if isinstance(payload, dict) and payload.get("type") == "text":
+            payload = payload.get("text", "")
 
         widget = QWidget()
         widget.setObjectName("BubbleMine" if mine else "BubblePeer")
         widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         row = QHBoxLayout(widget)
+        row.setContentsMargins(8, 6, 8, 6)
+        row.setSpacing(0)
 
         is_file = False
         file_name = None
@@ -3711,11 +3854,29 @@ class ChatWindow(QWidget):
             self.show_context_menu(pos, lbl, mid, is_f, fn, fb)
         )
 
+        bubble_content = lbl
+        show_sender = bool(sender_name) and not mine and self.current_chat_kind == "group"
+        if show_sender:
+            lbl.setObjectName("BubbleTextGroup")
+            wrap = QFrame()
+            wrap.setObjectName("BubbleGroupWrap")
+            wrap.setFrameShape(QFrame.Shape.NoFrame)
+            wrap_layout = QVBoxLayout(wrap)
+            wrap_layout.setContentsMargins(0, 0, 0, 0)
+            wrap_layout.setSpacing(0)
+            sender_lbl = QLabel(str(sender_name))
+            sender_lbl.setObjectName("BubbleSender")
+            sender_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            sender_lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            wrap_layout.addWidget(sender_lbl, 0, Qt.AlignmentFlag.AlignLeft)
+            wrap_layout.addWidget(lbl)
+            bubble_content = wrap
+
         if mine:
             row.addStretch()
-            row.addWidget(lbl)
+            row.addWidget(bubble_content)
         else:
-            row.addWidget(lbl)
+            row.addWidget(bubble_content)
             row.addStretch()
 
         align = Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft
@@ -3858,7 +4019,18 @@ class ChatWindow(QWidget):
             return
 
         if self.current_chat_kind == "group" and self.current_group_id is not None:
-            self.net.send_group_message(self.current_group_id, txt, secure_mode=False)
+            encrypted_payload = self.net.encrypt_group_payload(
+                self.current_group_id,
+                {"type": "text", "text": txt},
+            )
+            if encrypted_payload is None:
+                QMessageBox.warning(
+                    self,
+                    "Group Security",
+                    "Group encryption key is unavailable. Reopen the group chat and try again.",
+                )
+                return
+            self.net.send_group_message(self.current_group_id, encrypted_payload, secure_mode=True)
             self.input.clear()
             return
 
@@ -3908,9 +4080,11 @@ class ChatWindow(QWidget):
         if gid is None:
             return
         if self.current_chat_kind == "group" and self.current_group_id == gid:
-            if isinstance(payload, dict) and payload.get("type") == "file_chunk":
+            decoded = self._decode_group_payload(gid, payload, source="sent")
+            if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
+                self._handle_group_file_chunk(gid, self.username, decoded, True, source="sent")
                 return
-            self.bubble(payload, True, msg_id, source="sent")
+            self.bubble(decoded, True, msg_id, source="sent")
 
     def on_group_message(self, group_id, sender, payload, msg_id):
         gid = self._normalize_group_id(group_id)
@@ -3925,7 +4099,11 @@ class ChatWindow(QWidget):
                 members.add(sender)
                 group["members"] = sorted(members)
         if self.current_chat_kind == "group" and self.current_group_id == gid:
-            self.bubble(payload, False, msg_id, source="live")
+            decoded = self._decode_group_payload(gid, payload, source="live")
+            if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
+                self._handle_group_file_chunk(gid, sender, decoded, False, source="live")
+                return
+            self.bubble(decoded, False, msg_id, source="live", sender_name=sender)
 
     def group_history(self, group_id, messages):
         gid = self._normalize_group_id(group_id)
@@ -3936,7 +4114,18 @@ class ChatWindow(QWidget):
         self.clear_chat()
         for m in messages:
             sender = m.get("sender")
-            self.bubble(m.get("payload"), sender == self.username, m.get("id"), source="history")
+            mine = sender == self.username
+            decoded = self._decode_group_payload(gid, m.get("payload"), source="history")
+            if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
+                self._handle_group_file_chunk(gid, sender, decoded, mine, source="history")
+                continue
+            self.bubble(
+                decoded,
+                mine,
+                m.get("id"),
+                source="history",
+                sender_name=None if mine else sender
+            )
         group = self.group_chats.get(gid)
         if isinstance(group, dict):
             members = set(group.get("members") or [])
@@ -4076,6 +4265,24 @@ class ChatWindow(QWidget):
         op = event.get("op") or "group"
         err = event.get("error") or "Unknown group operation error."
         QMessageBox.warning(self, f"Group Error: {op}", str(err))
+
+    def on_group_key_update(self, event):
+        if not isinstance(event, dict):
+            return
+        gid = self._normalize_group_id(event.get("group_id"))
+        if gid is None:
+            return
+        group = self.group_chats.get(gid)
+        if isinstance(group, dict):
+            epoch = event.get("key_epoch")
+            key_b64 = event.get("group_key")
+            if epoch:
+                group["key_epoch"] = epoch
+            if key_b64:
+                group["group_key"] = key_b64
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            reason = str(event.get("reason") or "updated").replace("_", " ")
+            self.bubble(f"[System] Group encryption key {reason}.", False, None, source="live")
 
     def remove_by_id(self, msg_id):
         if msg_id in self.bubbles:
@@ -4616,6 +4823,7 @@ class App:
         self.signals.group_history.connect(self.on_group_history)
         self.signals.group_left.connect(self.on_group_left)
         self.signals.group_error.connect(self.on_group_error)
+        self.signals.group_key_update.connect(self.on_group_key_update)
         self.signals.delete.connect(lambda msg_id: self.chat_win.remove_by_id(msg_id) if self.chat_win else None)
         self.signals.msg_sent.connect(lambda mid, to, payload: self.chat_win.on_msg_sent(mid, to, payload) if self.chat_win else None)
         self.signals.group_msg_sent.connect(
@@ -4716,6 +4924,10 @@ class App:
     def on_group_error(self, event):
         if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
             self.chat_win.on_group_error(event)
+
+    def on_group_key_update(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_key_update(event)
 
     def on_register(self, data):
         if data.get("status") == "ok":

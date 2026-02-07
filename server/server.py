@@ -210,6 +210,15 @@ def ensure_schema():
             INDEX idx_group_owner (owner)
         )
     """)
+    cur.execute("SHOW COLUMNS FROM chat_groups LIKE 'history_policy'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE chat_groups ADD COLUMN history_policy VARCHAR(16) NOT NULL DEFAULT 'since_join'")
+    cur.execute("SHOW COLUMNS FROM chat_groups LIKE 'key_epoch'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE chat_groups ADD COLUMN key_epoch VARCHAR(48) NULL")
+    cur.execute("SHOW COLUMNS FROM chat_groups LIKE 'group_key'")
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE chat_groups ADD COLUMN group_key TEXT NULL")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS group_members (
             group_id INT NOT NULL,
@@ -253,6 +262,18 @@ def ensure_schema():
             cur.execute("ALTER TABLE group_messages MODIFY payload MEDIUMTEXT")
         elif g_col_type in ("tinytext",):
             cur.execute("ALTER TABLE group_messages MODIFY payload MEDIUMTEXT")
+    cur.execute("""
+        SELECT id
+        FROM chat_groups
+        WHERE key_epoch IS NULL OR key_epoch = '' OR group_key IS NULL OR group_key = ''
+    """)
+    missing_crypto = cur.fetchall()
+    for row in missing_crypto:
+        group_id = row[0]
+        cur.execute(
+            "UPDATE chat_groups SET key_epoch=%s, group_key=%s WHERE id=%s",
+            (_new_group_epoch(), _new_group_key_b64(), group_id),
+        )
     conn.commit()
     cur.close()
     conn.close()
@@ -417,6 +438,21 @@ def _new_group_uuid():
     return base64.urlsafe_b64encode(secrets.token_bytes(9)).decode("ascii").rstrip("=")
 
 
+def _new_group_epoch():
+    return base64.urlsafe_b64encode(secrets.token_bytes(9)).decode("ascii").rstrip("=")
+
+
+def _new_group_key_b64():
+    return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+def _normalize_history_policy(raw_policy):
+    policy = str(raw_policy or "").strip().lower()
+    if policy in ("since_join", "full"):
+        return policy
+    return "since_join"
+
+
 def _normalize_group_name(raw_name):
     cleaned = " ".join(str(raw_name or "").split())
     return cleaned[:128]
@@ -447,6 +483,7 @@ def _parse_group_id(raw_group_id):
 def _row_to_group_info(row):
     if not isinstance(row, dict):
         return None
+    history_policy = _normalize_history_policy(row.get("history_policy"))
     return {
         "group_id": row.get("id"),
         "group_uuid": row.get("group_uuid"),
@@ -454,6 +491,9 @@ def _row_to_group_info(row):
         "owner": row.get("owner"),
         "role": row.get("role") or "member",
         "member_count": int(row.get("member_count") or 0),
+        "history_policy": history_policy,
+        "key_epoch": row.get("key_epoch"),
+        "group_key": row.get("group_key"),
     }
 
 
@@ -466,6 +506,9 @@ def get_user_groups(username):
             g.group_uuid,
             g.name,
             g.owner,
+            g.history_policy,
+            g.key_epoch,
+            g.group_key,
             gm.role,
             (
                 SELECT COUNT(*)
@@ -497,6 +540,9 @@ def get_group_info_for_user(group_id, username):
             g.group_uuid,
             g.name,
             g.owner,
+            g.history_policy,
+            g.key_epoch,
+            g.group_key,
             gm.role,
             (
                 SELECT COUNT(*)
@@ -526,6 +572,16 @@ def get_group_members(group_id):
     cur.close()
     conn.close()
     return [r["username"] for r in rows if r.get("username")]
+
+
+def rotate_group_key_tx(cur, group_id):
+    epoch = _new_group_epoch()
+    group_key = _new_group_key_b64()
+    cur.execute(
+        "UPDATE chat_groups SET key_epoch = %s, group_key = %s WHERE id = %s",
+        (epoch, group_key, group_id),
+    )
+    return epoch, group_key
 
 
 def is_group_member(username, group_id):
@@ -941,6 +997,7 @@ async def handle_client(reader, writer):
             elif mtype == "create_group" and user:
                 group_name = _normalize_group_name(msg.get("name"))
                 members = [u for u in _normalize_user_list(msg.get("members")) if u != user]
+                history_policy = _normalize_history_policy(msg.get("history_policy"))
 
                 if not group_name:
                     await safe_write(writer, {
@@ -955,6 +1012,8 @@ async def handle_client(reader, writer):
                 invite_events = []
                 group_id = None
                 group_uuid = None
+                group_epoch = _new_group_epoch()
+                group_key = _new_group_key_b64()
                 try:
                     if members:
                         placeholders = ", ".join(["%s"] * len(members))
@@ -974,9 +1033,9 @@ async def handle_client(reader, writer):
 
                     group_uuid = _new_group_uuid()
                     cur.execute("""
-                        INSERT INTO chat_groups (group_uuid, name, owner)
-                        VALUES (%s, %s, %s)
-                    """, (group_uuid, group_name, user))
+                        INSERT INTO chat_groups (group_uuid, name, owner, history_policy, key_epoch, group_key)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (group_uuid, group_name, user, history_policy, group_epoch, group_key))
                     group_id = cur.lastrowid
 
                     cur.execute("""
@@ -1175,6 +1234,8 @@ async def handle_client(reader, writer):
                 cur = conn.cursor(dictionary=True)
                 group_id = None
                 invited_by = None
+                rotated_epoch = None
+                rotated_key = None
                 try:
                     cur.execute("""
                         SELECT
@@ -1208,6 +1269,7 @@ async def handle_client(reader, writer):
                             SET status = 'accepted', responded_at = NOW()
                             WHERE id = %s
                         """, (invite_id,))
+                        rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
                     else:
                         cur.execute("""
                             UPDATE group_invites
@@ -1254,6 +1316,16 @@ async def handle_client(reader, writer):
                                 "group_id": group_id,
                                 "username": user
                             })
+                    if rotated_epoch and rotated_key:
+                        for member in members:
+                            if member in clients:
+                                await safe_write(clients[member], {
+                                    "type": "group_key_update",
+                                    "group_id": group_id,
+                                    "key_epoch": rotated_epoch,
+                                    "group_key": rotated_key,
+                                    "reason": "member_added",
+                                })
 
                 if invited_by in clients:
                     await safe_write(clients[invited_by], {
@@ -1280,6 +1352,8 @@ async def handle_client(reader, writer):
                 owner_before = None
                 remaining_members = []
                 new_owner = None
+                rotated_epoch = None
+                rotated_key = None
                 try:
                     cur.execute("SELECT owner FROM chat_groups WHERE id = %s LIMIT 1", (group_id,))
                     group_row = cur.fetchone()
@@ -1337,6 +1411,9 @@ async def handle_client(reader, writer):
                             SET role = CASE WHEN username = %s THEN 'owner' ELSE 'member' END
                             WHERE group_id = %s
                         """, (new_owner, group_id))
+                        rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
+                    else:
+                        rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
 
                     conn.commit()
                 except Error as e:
@@ -1365,6 +1442,16 @@ async def handle_client(reader, writer):
                             "username": user,
                             "new_owner": new_owner
                         })
+                if rotated_epoch and rotated_key:
+                    for member in remaining_members:
+                        if member in clients:
+                            await safe_write(clients[member], {
+                                "type": "group_key_update",
+                                "group_id": group_id,
+                                "key_epoch": rotated_epoch,
+                                "group_key": rotated_key,
+                                "reason": "member_left",
+                            })
 
             # ---------- GROUP MESSAGE ----------
             elif mtype == "group_msg" and user:
@@ -1454,11 +1541,27 @@ async def handle_client(reader, writer):
                 conn = get_db()
                 cur = conn.cursor(dictionary=True)
                 cur.execute("""
+                    SELECT g.history_policy, gm.joined_at
+                    FROM chat_groups g
+                    JOIN group_members gm ON gm.group_id = g.id
+                    WHERE g.id = %s AND gm.username = %s
+                    LIMIT 1
+                """, (group_id, user))
+                group_row = cur.fetchone() or {}
+                history_policy = _normalize_history_policy(group_row.get("history_policy"))
+                joined_at = group_row.get("joined_at")
+
+                history_query = """
                     SELECT id, sender, payload, secure_mode
                     FROM group_messages
                     WHERE group_id = %s
-                    ORDER BY ts
-                """, (group_id,))
+                """
+                params = [group_id]
+                if history_policy == "since_join" and joined_at is not None:
+                    history_query += " AND ts >= %s"
+                    params.append(joined_at)
+                history_query += " ORDER BY ts"
+                cur.execute(history_query, tuple(params))
                 rows = cur.fetchall()
                 cur.close()
                 conn.close()

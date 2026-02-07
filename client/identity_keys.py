@@ -572,3 +572,165 @@ class NormalSessionStore:
             "created": entry.get("created"),
             "peer_device_id": entry.get("peer_device_id"),
         }
+
+
+class GroupSessionStore:
+    def __init__(self, config_dir=".chat_config", service="secure_chat", warning_callback=None):
+        self.config_dir = Path(config_dir)
+        self.config_dir.mkdir(exist_ok=True)
+        self._volatile = {}
+        self._storage_warning_emitted = False
+        self._warning_callback = warning_callback
+        self._keyring = None
+        try:
+            self._keyring = _KeyringStore(service)
+        except Exception:
+            self._keyring = None
+        self._dpapi = _DPAPIStore(self.config_dir / "group_sessions.json")
+        self._store_key = "group:sessions"
+
+    def _warn_storage_issue(self, action, err):
+        if self._storage_warning_emitted:
+            return
+        self._storage_warning_emitted = True
+        message = (
+            f"[GROUP][WARN] Secure group key persistence disabled ({action} failed: {err}). "
+            "Using volatile in-memory storage for this session."
+        )
+        print(message)
+        if callable(self._warning_callback):
+            try:
+                self._warning_callback(message)
+            except Exception:
+                pass
+
+    def _load_all(self):
+        data = None
+        if self._keyring:
+            try:
+                data = self._keyring.get_json(self._store_key)
+            except Exception:
+                data = None
+        if data is None:
+            try:
+                data = self._dpapi.load()
+            except RuntimeError as e:
+                self._warn_storage_issue("load", e)
+                data = self._volatile
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    def _save_all(self, data):
+        if not isinstance(data, dict):
+            return
+        if self._keyring:
+            try:
+                self._keyring.set_json(self._store_key, data)
+                return
+            except Exception:
+                pass
+        self._volatile = dict(data)
+        try:
+            self._dpapi.save(data)
+        except RuntimeError as e:
+            self._warn_storage_issue("save", e)
+
+    def _load_user(self, username):
+        data = self._load_all()
+        entry = data.get(username)
+        if isinstance(entry, dict):
+            return entry
+        return {}
+
+    def _save_user(self, username, entry):
+        if not isinstance(entry, dict):
+            return
+        data = self._load_all()
+        data[username] = entry
+        self._save_all(data)
+
+    def _group_key(self, group_id):
+        try:
+            gid = int(group_id)
+        except (TypeError, ValueError):
+            return None
+        return str(gid) if gid > 0 else None
+
+    def get_group(self, username, group_id):
+        if not username:
+            return {"current": None, "epochs": {}}
+        gid = self._group_key(group_id)
+        if gid is None:
+            return {"current": None, "epochs": {}}
+        user_entry = self._load_user(username)
+        group_entry = user_entry.get(gid, {})
+        if not isinstance(group_entry, dict):
+            return {"current": None, "epochs": {}}
+        current = group_entry.get("current")
+        epochs_raw = group_entry.get("epochs", {})
+        epochs = {}
+        if isinstance(epochs_raw, dict):
+            for epoch_id, entry in epochs_raw.items():
+                if not isinstance(entry, dict):
+                    continue
+                key_b64 = entry.get("key")
+                if not key_b64:
+                    continue
+                try:
+                    epochs[str(epoch_id)] = base64.b64decode(key_b64)
+                except Exception:
+                    continue
+        return {"current": current, "epochs": epochs}
+
+    def get_epoch(self, username, group_id, epoch_id):
+        state = self.get_group(username, group_id)
+        return state.get("epochs", {}).get(str(epoch_id))
+
+    def set_epoch(self, username, group_id, epoch_id, key_bytes, set_current=False):
+        if not username or not epoch_id or not key_bytes:
+            return
+        gid = self._group_key(group_id)
+        if gid is None:
+            return
+        user_entry = self._load_user(username)
+        group_entry = user_entry.get(gid, {})
+        if not isinstance(group_entry, dict):
+            group_entry = {}
+        epochs = group_entry.get("epochs", {})
+        if not isinstance(epochs, dict):
+            epochs = {}
+        epochs[str(epoch_id)] = {
+            "key": base64.b64encode(key_bytes).decode("ascii"),
+            "created": time.time(),
+        }
+        group_entry["epochs"] = epochs
+        if set_current:
+            group_entry["current"] = str(epoch_id)
+        user_entry[gid] = group_entry
+        self._save_user(username, user_entry)
+
+    def set_current_epoch(self, username, group_id, epoch_id):
+        if not username or not epoch_id:
+            return
+        gid = self._group_key(group_id)
+        if gid is None:
+            return
+        user_entry = self._load_user(username)
+        group_entry = user_entry.get(gid, {})
+        if not isinstance(group_entry, dict):
+            group_entry = {}
+        group_entry["current"] = str(epoch_id)
+        user_entry[gid] = group_entry
+        self._save_user(username, user_entry)
+
+    def remove_group(self, username, group_id):
+        if not username:
+            return
+        gid = self._group_key(group_id)
+        if gid is None:
+            return
+        user_entry = self._load_user(username)
+        if gid in user_entry:
+            user_entry.pop(gid, None)
+            self._save_user(username, user_entry)
