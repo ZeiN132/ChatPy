@@ -1232,7 +1232,7 @@ class SecureSessionDialog(QFrame):
         self.deleteLater()
 
 class CustomDeleteDialog(QFrame):
-    def __init__(self, parent, msg_id, on_confirm):
+    def __init__(self, parent, msg_id, on_confirm, show_for_all=True):
         super().__init__(parent)
         self.setObjectName("ConfirmDialog")
         self.setFixedSize(320, 180)
@@ -1251,6 +1251,8 @@ class CustomDeleteDialog(QFrame):
         self.checkbox = QCheckBox("Delete for everyone")
         self.checkbox.setChecked(True)
         self.checkbox.setStyleSheet("border: none; background: transparent; font-size: 13px;")
+        if not show_for_all:
+            self.checkbox.hide()
 
         btn_lay = QHBoxLayout()
         self.yes_btn = QPushButton("DELETE")
@@ -2017,6 +2019,7 @@ class Signals(QObject):
     group_member_left = pyqtSignal(dict)
     group_message = pyqtSignal(object, str, object, object)
     group_msg_sent = pyqtSignal(object, object, object)
+    group_message_deleted = pyqtSignal(dict)
     group_history = pyqtSignal(object, list)
     group_left = pyqtSignal(object)
     group_deleted = pyqtSignal(dict)
@@ -3653,7 +3656,7 @@ class ChatWindow(QWidget):
         lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lbl.customContextMenuRequested.connect(
             lambda pos, fn=file_name, fb=file_bytes:
-            self.show_context_menu(pos, lbl, None, True, fn, fb)
+            self.show_context_menu(pos, lbl, None, True, fn, fb, can_delete=False)
         )
 
         bubble_content = lbl
@@ -3868,10 +3871,16 @@ class ChatWindow(QWidget):
         lbl.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
         lbl.setObjectName("BubbleText")
 
+        can_delete = msg_id is not None
+        if self.current_chat_kind == "group" and self.current_group_id is not None:
+            group = self.group_chats.get(self.current_group_id, {})
+            is_owner = str(group.get("owner") or "") == self.username
+            can_delete = bool(mine or is_owner)
+
         lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lbl.customContextMenuRequested.connect(
-            lambda pos, mid=msg_id, fn=file_name, fb=file_bytes, is_f=is_file: 
-            self.show_context_menu(pos, lbl, mid, is_f, fn, fb)
+            lambda pos, mid=msg_id, fn=file_name, fb=file_bytes, is_f=is_file, can_del=can_delete:
+            self.show_context_menu(pos, lbl, mid, is_f, fn, fb, can_delete=can_del)
         )
 
         bubble_content = lbl
@@ -3925,7 +3934,7 @@ class ChatWindow(QWidget):
         bar.setValue(bar.maximum())
         QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
 
-    def show_context_menu(self, pos, target_widget, msg_id, is_file, filename, data):
+    def show_context_menu(self, pos, target_widget, msg_id, is_file, filename, data, can_delete=True):
         if is_file and (filename is None or data is None):
             return
 
@@ -3943,7 +3952,7 @@ class ChatWindow(QWidget):
         else:
             copy_act = menu.addAction("Copy text")
 
-        del_act = menu.addAction("Delete")
+        del_act = menu.addAction("Delete") if (can_delete and msg_id is not None) else None
 
         action = menu.exec(target_widget.mapToGlobal(pos))
 
@@ -3955,7 +3964,7 @@ class ChatWindow(QWidget):
             elif action is copy_act:
                 text_to_copy = filename if is_file else target_widget.text()
                 QGuiApplication.clipboard().setText(text_to_copy)
-            elif action is del_act:
+            elif del_act is not None and action is del_act:
                 if msg_id is not None:
                     self.ask_delete(msg_id)
 
@@ -4023,11 +4032,21 @@ class ChatWindow(QWidget):
 
     def ask_delete(self, msg_id):
         self.overlay.fade_in()
-        dialog = CustomDeleteDialog(self.overlay, msg_id, self.finish_delete)
+        is_group_chat = self.current_chat_kind == "group" and self.current_group_id is not None
+        dialog = CustomDeleteDialog(
+            self.overlay,
+            msg_id,
+            self.finish_delete,
+            show_for_all=not is_group_chat,
+        )
         dialog.move((self.width()-320)//2, (self.height()-180)//2)
         dialog.show()
 
     def finish_delete(self, msg_id, for_all):
+        if self.current_chat_kind == "group" and self.current_group_id is not None:
+            self.net.delete_group_message(self.current_group_id, msg_id)
+            return
+
         if msg_id in self.bubbles:
             self.bubbles[msg_id].deleteLater()
             del self.bubbles[msg_id]
@@ -4330,6 +4349,16 @@ class ChatWindow(QWidget):
         if self.current_chat_kind == "group" and self.current_group_id == gid:
             reason = str(event.get("reason") or "updated").replace("_", " ")
             self.bubble(f"[System] Group encryption key {reason}.", False, None, source="live")
+
+    def on_group_message_deleted(self, event):
+        if not isinstance(event, dict):
+            return
+        gid = self._normalize_group_id(event.get("group_id"))
+        msg_id = event.get("id")
+        if gid is None or msg_id is None:
+            return
+        if self.current_chat_kind == "group" and self.current_group_id == gid:
+            self.remove_by_id(msg_id)
 
     def remove_by_id(self, msg_id):
         if msg_id in self.bubbles:
@@ -4867,6 +4896,7 @@ class App:
         self.signals.group_member_added.connect(self.on_group_member_added)
         self.signals.group_member_left.connect(self.on_group_member_left)
         self.signals.group_message.connect(self.on_group_message)
+        self.signals.group_message_deleted.connect(self.on_group_message_deleted)
         self.signals.group_history.connect(self.on_group_history)
         self.signals.group_left.connect(self.on_group_left)
         self.signals.group_deleted.connect(self.on_group_deleted)
@@ -4960,6 +4990,10 @@ class App:
     def on_group_message(self, group_id, sender, payload, msg_id):
         if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
             self.chat_win.on_group_message(group_id, sender, payload, msg_id)
+
+    def on_group_message_deleted(self, event):
+        if self.chat_win and not getattr(self.chat_win, "is_decoy", False):
+            self.chat_win.on_group_message_deleted(event)
 
     def on_group_history(self, group_id, messages):
         if self.chat_win and not getattr(self.chat_win, "is_decoy", False):

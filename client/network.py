@@ -328,6 +328,12 @@ class ClientNetwork:
                     except Exception:
                         pass
 
+                elif msg_type == "group_delete_msg":
+                    try:
+                        self.signals.group_message_deleted.emit(msg)
+                    except Exception:
+                        pass
+
                 elif msg_type == "group_history":
                     try:
                         self.signals.group_history.emit(
@@ -1510,6 +1516,13 @@ class ClientNetwork:
             "group_id": group_id,
             "payload": payload,
             "secure_mode": bool(secure_mode)
+        })
+
+    def delete_group_message(self, group_id, msg_id):
+        self.send({
+            "type": "group_delete_msg",
+            "group_id": group_id,
+            "id": msg_id
         })
 
     def request_history(self, peer):

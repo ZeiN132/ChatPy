@@ -1888,6 +1888,95 @@ async def handle_client(reader, writer):
                     finally:
                         cur.close()
                         conn.close()
+
+            # ---------- DELETE GROUP MESSAGE ----------
+            elif mtype == "group_delete_msg" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                msg_id = _parse_group_id(msg.get("id"))
+                if not group_id or not msg_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_delete_msg",
+                        "error": "group_id and id are required"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                deleted = False
+                try:
+                    cur.execute("""
+                        SELECT gm.sender, g.owner
+                        FROM group_messages gm
+                        JOIN chat_groups g ON g.id = gm.group_id
+                        WHERE gm.id = %s AND gm.group_id = %s
+                        LIMIT 1
+                    """, (msg_id, group_id))
+                    row = cur.fetchone()
+                    if not row:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "group_delete_msg",
+                            "error": "Group message not found"
+                        })
+                        continue
+
+                    cur.execute("""
+                        SELECT role
+                        FROM group_members
+                        WHERE group_id = %s AND username = %s
+                        LIMIT 1
+                    """, (group_id, user))
+                    member_row = cur.fetchone()
+                    if not member_row:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "group_delete_msg",
+                            "error": "You are not a member of this group"
+                        })
+                        continue
+
+                    sender = row.get("sender")
+                    owner = row.get("owner")
+                    role = str(member_row.get("role") or "").strip().lower()
+                    can_delete = (sender == user) or (owner == user) or (role == "owner")
+                    if not can_delete:
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "group_delete_msg",
+                            "error": "You can delete only your own messages (or all messages as owner)"
+                        })
+                        continue
+
+                    cur.execute("""
+                        DELETE FROM group_messages
+                        WHERE id = %s AND group_id = %s
+                    """, (msg_id, group_id))
+                    deleted = cur.rowcount > 0
+                    conn.commit()
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP DELETE MSG ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_delete_msg",
+                        "error": "Failed to delete group message"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                if deleted:
+                    members = get_group_members(group_id)
+                    for member in members:
+                        if member in clients:
+                            await safe_write(clients[member], {
+                                "type": "group_delete_msg",
+                                "group_id": group_id,
+                                "id": msg_id,
+                                "deleted_by": user
+                            })
             
             # ---------- CLOSE SECURE CHAT ----------
             elif mtype == "close_secure_chat" and user:
