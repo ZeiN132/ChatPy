@@ -53,7 +53,7 @@ class ClientNetwork:
         self.connected = False
         self.sock = None
         self.file = None
-        self.server_host = os.getenv("CHATPY_SERVER_HOST", "34.46.154.216")
+        self.server_host = os.getenv("CHATPY_SERVER_HOST", "104.154.214.127")
         try:
             self.server_port = int(os.getenv("CHATPY_SERVER_PORT", "9999"))
         except ValueError:
