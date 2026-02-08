@@ -1020,7 +1020,7 @@ async def handle_client(reader, writer):
                 if not allowed:
                     print(f"[LOGIN LIMIT] username={username} ip={addr[0] if addr else 'unknown'} retry_after={int(retry_after)}s")
                     await asyncio.sleep(LOGIN_FAIL_DELAY)
-                    await safe_write(writer, {"status": "error", "error": "Invalid login"})
+                    await safe_write(writer, {"type": "auth", "status": "error", "error": "Invalid login"})
                     continue
 
                 conn = get_db()
@@ -1041,12 +1041,13 @@ async def handle_client(reader, writer):
                     if not valid_login:
                         record_login_failure(login_key)
                         await asyncio.sleep(LOGIN_FAIL_DELAY)
-                        await safe_write(writer, {"status": "error", "error": "Invalid login"})
+                        await safe_write(writer, {"type": "auth", "status": "error", "error": "Invalid login"})
                         continue
 
                     clear_login_failures(login_key)
                     print(f"[DEBUG] Processing NORMAL login for {username}")
                     await safe_write(writer, {
+                        "type": "auth",
                         "status": "ok",
                         "username": username,
                         "users": get_all_users(),
