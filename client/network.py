@@ -5,6 +5,8 @@ import os
 import base64
 import time
 import ssl
+import http.client
+import urllib.parse
 from collections import deque
 from cryptography.hazmat.primitives import serialization
 from .crypto_utils import (
@@ -60,6 +62,14 @@ class ClientNetwork:
         self.tls_ca_file = os.getenv("CHATPY_TLS_CA_FILE")
         self.tls_server_name = os.getenv("CHATPY_TLS_SERVER_NAME") or self.server_host
         self.tls_min_version = _parse_tls_min_version(os.getenv("CHATPY_TLS_MIN_VERSION", "1.2"))
+        self.file_server_host = os.getenv("CHATPY_FILE_HOST", self.server_host)
+        try:
+            self.file_server_port = int(os.getenv("CHATPY_FILE_PORT", "8080"))
+        except ValueError:
+            self.file_server_port = 8080
+        self.file_server_scheme = os.getenv("CHATPY_FILE_SCHEME", "http").lower()
+        self.file_upload_path = os.getenv("CHATPY_FILE_UPLOAD_PATH", "/upload")
+        self.file_download_path = os.getenv("CHATPY_FILE_DOWNLOAD_PATH", "/files")
         self.sessions = {}
         self.pending_exchanges = {}
         self.approved_peers = set()
@@ -498,6 +508,87 @@ class ClientNetwork:
         except (TypeError, ValueError):
             return None
         return gid if gid > 0 else None
+
+    def generate_file_id(self):
+        return base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
+
+    def _file_base_url(self):
+        host = self.file_server_host
+        port = self.file_server_port
+        scheme = self.file_server_scheme or "http"
+        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+            return f"{scheme}://{host}"
+        return f"{scheme}://{host}:{port}"
+
+    def build_file_url(self, file_id):
+        base = self._file_base_url()
+        path = self.file_download_path.rstrip("/") + "/" + str(file_id)
+        return base + path
+
+    def _http_connection(self, url):
+        parsed = urllib.parse.urlparse(url)
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname
+        port = parsed.port
+        if not host:
+            raise RuntimeError("Invalid file server URL")
+        if scheme == "https":
+            return http.client.HTTPSConnection(host, port or 443, timeout=60), parsed
+        return http.client.HTTPConnection(host, port or 80, timeout=60), parsed
+
+    def upload_file_ciphertext(self, file_id, ciphertext_bytes, meta):
+        if not isinstance(ciphertext_bytes, (bytes, bytearray)):
+            raise ValueError("ciphertext must be bytes")
+        url = self._file_base_url() + self.file_upload_path.rstrip("/") + "/" + str(file_id)
+        conn, parsed = self._http_connection(url)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(ciphertext_bytes)),
+        }
+        if isinstance(meta, dict):
+            if meta.get("name"):
+                headers["X-File-Name"] = str(meta.get("name"))
+            if meta.get("size") is not None:
+                headers["X-File-Size"] = str(meta.get("size"))
+            if meta.get("mime"):
+                headers["X-File-Mime"] = str(meta.get("mime"))
+            if meta.get("sha256"):
+                headers["X-File-Sha256"] = str(meta.get("sha256"))
+
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        try:
+            conn.request("POST", path, body=bytes(ciphertext_bytes), headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()
+        finally:
+            conn.close()
+        if resp.status != 200:
+            raise RuntimeError(f"Upload failed: {resp.status}")
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception:
+            payload = {}
+        if payload.get("status") != "ok":
+            raise RuntimeError(payload.get("error") or "Upload failed")
+        return payload.get("url") or self.build_file_url(file_id)
+
+    def download_file_ciphertext(self, file_id, url=None):
+        target_url = url or self.build_file_url(file_id)
+        conn, parsed = self._http_connection(target_url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            data = resp.read()
+        finally:
+            conn.close()
+        if resp.status != 200:
+            raise RuntimeError(f"Download failed: {resp.status}")
+        return data
 
     def _group_aad(self, group_id, epoch_id):
         gid = self._normalize_group_id(group_id)

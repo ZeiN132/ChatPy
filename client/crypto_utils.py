@@ -133,3 +133,17 @@ def decrypt_msg(key, encrypted_data, aad=None):
     plaintext = cipher.decrypt(nonce, ciphertext, aad)
     
     return plaintext
+
+def encrypt_bytes(key, plaintext, aad=None):
+    """Encrypt raw bytes with ChaCha20-Poly1305 and return (nonce, ciphertext)."""
+    if not isinstance(plaintext, (bytes, bytearray)):
+        raise ValueError("plaintext must be bytes")
+    cipher = ChaCha20Poly1305(key)
+    nonce = os.urandom(12)
+    ciphertext = cipher.encrypt(nonce, bytes(plaintext), aad)
+    return nonce, ciphertext
+
+def decrypt_bytes(key, nonce, ciphertext, aad=None):
+    """Decrypt raw bytes with ChaCha20-Poly1305."""
+    cipher = ChaCha20Poly1305(key)
+    return cipher.decrypt(nonce, ciphertext, aad)

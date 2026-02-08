@@ -5,13 +5,27 @@ import os
 import traceback
 import random
 import hashlib
+import mimetypes
+import tempfile
+import threading
 from pathlib import Path
 import webbrowser
 from datetime import datetime
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, pyqtProperty, QTimer, QSize, QRect, QPoint
-from PyQt6.QtGui import QAction, QGuiApplication, QColor, QPainter, QBrush, QPixmap, QIcon
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPropertyAnimation, QEasingCurve, pyqtProperty, QTimer, QSize, QRect, QPoint, QUrl
+from PyQt6.QtGui import QAction, QGuiApplication, QColor, QPainter, QBrush, QPixmap, QIcon, QDesktopServices
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtMultimediaWidgets import QVideoWidget
+    _MEDIA_AVAILABLE = True
+except Exception:
+    QMediaPlayer = None
+    QAudioOutput = None
+    QVideoWidget = None
+    _MEDIA_AVAILABLE = False
 from .network import ClientNetwork
+from .crypto_utils import encrypt_bytes, decrypt_bytes
 from .dropbox_manager import DropboxManager
 from .identity_keys import IdentityPinStore, fingerprint_ed25519_pub
 from .forensic_protection import get_forensic_protection, get_secure_storage
@@ -2058,6 +2072,8 @@ class ChatWindow(QWidget):
         self._secure_handshake_timeout_ms = 30000
         self._incoming_files = {}
         self._file_chunk_size = 32 * 1024
+        self._temp_files = []
+        self._media_dialogs = []
         self.identity_pins = IdentityPinStore(
             config_dir=self.config_dir,
             warning_callback=self._relay_storage_warning,
@@ -3536,16 +3552,85 @@ class ChatWindow(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Select file", "", "All Files (*)")
         if not path:
             return
-        fname = os.path.basename(path)
-        with open(path, "rb") as f:
-            file_bytes = f.read()
-        if self.current_chat_kind == "group":
-            if self.current_group_id is None:
-                return
-            self._send_group_file_in_chunks(self.current_group_id, fname, file_bytes)
+        if not os.path.isfile(path):
             return
-        if self.peer:
-            self._send_file_in_chunks(fname, file_bytes)
+        self._send_file_via_storage(path)
+
+    def _send_file_via_storage(self, path):
+        try:
+            file_size = os.path.getsize(path)
+        except Exception:
+            file_size = 0
+        if file_size > 200 * 1024 * 1024:
+            QMessageBox.warning(self, "File too large", "Max file size is 200MB.")
+            return
+
+        def _worker():
+            try:
+                filename = os.path.basename(path)
+                mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                sha256 = hashlib.sha256(data).hexdigest()
+                file_id = self.net.generate_file_id()
+                file_key = os.urandom(32)
+                aad = f"chatpy-file-v1|{file_id}|{len(data)}".encode("utf-8")
+                nonce, ciphertext = encrypt_bytes(file_key, data, aad=aad)
+
+                meta = {
+                    "name": filename,
+                    "size": len(data),
+                    "mime": mime,
+                    "sha256": sha256,
+                }
+                url = self.net.upload_file_ciphertext(file_id, ciphertext, meta)
+
+                file_meta = {
+                    "type": "file_meta",
+                    "file_id": file_id,
+                    "name": filename,
+                    "size": len(data),
+                    "mime": mime,
+                    "sha256": sha256,
+                    "url": url,
+                    "key_b64": base64.b64encode(file_key).decode("ascii"),
+                    "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+                    "enc": "chacha20poly1305",
+                    "v": 1,
+                }
+
+                if self.current_chat_kind == "group":
+                    gid = self.current_group_id
+                    if gid is None:
+                        raise RuntimeError("No group selected")
+                    encrypted_payload = self.net.encrypt_group_payload(gid, file_meta)
+                    if encrypted_payload is None:
+                        raise RuntimeError("Group encryption key is unavailable.")
+                    self.net.send_group_message(gid, encrypted_payload, secure_mode=True)
+                else:
+                    if not self.peer:
+                        raise RuntimeError("No peer selected")
+                    secure_mode = self.is_secure_session_active()
+                    payload_bytes = json.dumps(file_meta, ensure_ascii=False).encode("utf-8")
+                    if secure_mode:
+                        encrypted_payload = self.net.encrypt_for(self.peer, payload_bytes)
+                        if encrypted_payload is None:
+                            raise RuntimeError("Secure session not established")
+                        self.net.send_message(self.peer, encrypted_payload, secure_mode=True)
+                        QTimer.singleShot(0, lambda: self.bubble(file_meta, True, None, source="sent"))
+                    else:
+                        if self.is_peer_blocked(self.peer):
+                            raise RuntimeError("Untrusted key")
+                        if not self._ensure_peer_verified(self.peer):
+                            raise RuntimeError("Peer not verified")
+                        encrypted_payload = self.net.encrypt_normal(self.peer, payload_bytes)
+                        if encrypted_payload is None:
+                            raise RuntimeError("Normal session not established")
+                        self.net.send_message(self.peer, encrypted_payload, secure_mode=False)
+            except Exception as exc:
+                QTimer.singleShot(0, lambda: QMessageBox.warning(self, "File send error", str(exc)))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _send_file_in_chunks(self, filename, file_bytes):
         if not self.peer:
@@ -3820,6 +3905,174 @@ class ChatWindow(QWidget):
         self.chat_area.insertWidget(self.chat_area.count() - 1, widget, 0, align)
         self.scroll_to_bottom()
 
+    def _format_size(self, size):
+        try:
+            size = float(size)
+        except Exception:
+            return "?"
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024.0:
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    def _file_meta_aad(self, file_id, size):
+        return f"chatpy-file-v1|{file_id}|{size}".encode("utf-8")
+
+    def _download_and_decrypt_file(self, meta):
+        if not isinstance(meta, dict):
+            raise RuntimeError("Invalid file metadata")
+        file_id = str(meta.get("file_id") or "").strip()
+        if not file_id:
+            raise RuntimeError("Missing file_id")
+        key_b64 = meta.get("key_b64")
+        nonce_b64 = meta.get("nonce_b64")
+        if not key_b64 or not nonce_b64:
+            raise RuntimeError("Missing file key")
+        try:
+            file_key = base64.b64decode(key_b64)
+            nonce = base64.b64decode(nonce_b64)
+        except Exception:
+            raise RuntimeError("Invalid file key")
+
+        url = meta.get("url")
+        ciphertext = self.net.download_file_ciphertext(file_id, url=url)
+        size = int(meta.get("size") or 0)
+        aad = self._file_meta_aad(file_id, size)
+        plaintext = decrypt_bytes(file_key, nonce, ciphertext, aad=aad)
+
+        expected_hash = meta.get("sha256")
+        if expected_hash:
+            actual = hashlib.sha256(plaintext).hexdigest()
+            if actual != expected_hash:
+                raise RuntimeError("File integrity check failed")
+        return plaintext
+
+    def _fetch_file_async(self, meta, on_ready):
+        def _worker():
+            try:
+                data = self._download_and_decrypt_file(meta)
+                QTimer.singleShot(0, lambda: on_ready(data, None))
+            except Exception as exc:
+                QTimer.singleShot(0, lambda: on_ready(None, exc))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _open_media_dialog(self, file_path, mime):
+        if not _MEDIA_AVAILABLE:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(os.path.basename(file_path))
+        layout = QVBoxLayout(dlg)
+        player = QMediaPlayer(dlg)
+        audio = QAudioOutput(dlg)
+        player.setAudioOutput(audio)
+
+        video_widget = None
+        if mime and mime.startswith("video/") and QVideoWidget is not None:
+            video_widget = QVideoWidget(dlg)
+            player.setVideoOutput(video_widget)
+            layout.addWidget(video_widget)
+
+        controls = QHBoxLayout()
+        play_btn = QPushButton("Play")
+        pause_btn = QPushButton("Pause")
+        stop_btn = QPushButton("Stop")
+        controls.addWidget(play_btn)
+        controls.addWidget(pause_btn)
+        controls.addWidget(stop_btn)
+        layout.addLayout(controls)
+
+        play_btn.clicked.connect(player.play)
+        pause_btn.clicked.connect(player.pause)
+        stop_btn.clicked.connect(player.stop)
+
+        player.setSource(QUrl.fromLocalFile(file_path))
+        player.play()
+
+        dlg.player = player
+        dlg.audio = audio
+        dlg.video_widget = video_widget
+        dlg.show()
+        self._media_dialogs.append(dlg)
+
+    def _bubble_file_meta(self, meta, mine, sender_name=None):
+        name = meta.get("name") or "file"
+        size = meta.get("size") or 0
+        mime = meta.get("mime") or ""
+
+        widget = QWidget()
+        widget.setObjectName("BubbleMine" if mine else "BubblePeer")
+        widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(8, 6, 8, 6)
+        row.setSpacing(0)
+
+        wrap = QFrame()
+        wrap.setFrameShape(QFrame.Shape.NoFrame)
+        wrap_layout = QVBoxLayout(wrap)
+        wrap_layout.setContentsMargins(0, 0, 0, 0)
+        wrap_layout.setSpacing(6)
+
+        if sender_name and not mine and self.current_chat_kind == "group":
+            sender_lbl = QLabel(str(sender_name))
+            sender_lbl.setObjectName("BubbleSender")
+            sender_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            wrap_layout.addWidget(sender_lbl)
+
+        info = QLabel(f"{name}\n{self._format_size(size)}")
+        info.setWordWrap(True)
+        info.setObjectName("BubbleTextGroup" if sender_name and not mine else "BubbleText")
+        wrap_layout.addWidget(info)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        download_btn = QPushButton("Download")
+        btn_row.addWidget(download_btn)
+
+        play_btn = None
+        if mime.startswith("audio/") or mime.startswith("video/"):
+            play_btn = QPushButton("Play")
+            btn_row.addWidget(play_btn)
+
+        wrap_layout.addLayout(btn_row)
+
+        def _handle_download():
+            def _done(data, err):
+                if err:
+                    QMessageBox.warning(self, "Download failed", str(err))
+                    return
+                self.save_file(name, data)
+            self._fetch_file_async(meta, _done)
+
+        def _handle_play():
+            def _done(data, err):
+                if err:
+                    QMessageBox.warning(self, "Download failed", str(err))
+                    return
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix)
+                tmp.write(data)
+                tmp.flush()
+                tmp.close()
+                self._temp_files.append(tmp.name)
+                self._open_media_dialog(tmp.name, mime)
+            self._fetch_file_async(meta, _done)
+
+        download_btn.clicked.connect(_handle_download)
+        if play_btn is not None:
+            play_btn.clicked.connect(_handle_play)
+
+        if mine:
+            row.addStretch()
+            row.addWidget(wrap)
+        else:
+            row.addWidget(wrap)
+            row.addStretch()
+
+        align = Qt.AlignmentFlag.AlignRight if mine else Qt.AlignmentFlag.AlignLeft
+        self.chat_area.insertWidget(self.chat_area.count() - 1, widget, 0, align)
+        self.scroll_to_bottom()
+
     def save_file(self, filename, data):
         path, _ = QFileDialog.getSaveFileName(self, "Save file", filename)
         if path:
@@ -3899,7 +4152,14 @@ class ChatWindow(QWidget):
                         )
                     else:
                         return "Legacy normal message (unsupported)"
-                return decrypted_bytes.decode('utf-8')
+                text = decrypted_bytes.decode('utf-8', errors="replace")
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict) and parsed.get("type"):
+                        return parsed
+                except Exception:
+                    pass
+                return text
             except Exception as e:
                 if not (isinstance(payload, dict) and payload.get("purpose") == "normal_v1"):
                     print(f"[DECRYPT ERROR] {e}")
@@ -3922,6 +4182,9 @@ class ChatWindow(QWidget):
     def bubble(self, payload, mine, msg_id=None, source="live", sender_name=None):
         if isinstance(payload, dict) and payload.get("type") == "file_chunk":
             self._handle_file_chunk(payload, mine, source=source)
+            return
+        if isinstance(payload, dict) and payload.get("type") == "file_meta":
+            self._bubble_file_meta(payload, mine, sender_name=sender_name)
             return
         if isinstance(payload, dict) and payload.get("type") == "text":
             payload = payload.get("text", "")

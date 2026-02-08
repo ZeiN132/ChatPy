@@ -7,6 +7,9 @@ import time
 import base64
 from pathlib import Path
 import ssl
+import threading
+import re
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import mysql.connector
 from mysql.connector import Error
 from bcrypt import hashpw, gensalt, checkpw
@@ -33,6 +36,15 @@ _reset_attempts = {}
 _login_attempts = {}
 DUMMY_PASSWORD_HASH = hashpw(b"chatpy_dummy_password", gensalt())
 GROUP_E2E_V2_ENABLED = False
+
+FILE_STORAGE_DIR = Path(__file__).resolve().parent / "uploads"
+FILE_MAX_BYTES = 200 * 1024 * 1024
+FILE_TTL_SECONDS = 7 * 24 * 3600
+FILE_SERVER_HOST = os.getenv("CHATPY_FILE_HOST", "0.0.0.0")
+FILE_SERVER_PORT = int(os.getenv("CHATPY_FILE_PORT", "8080"))
+FILE_PUBLIC_SCHEME = os.getenv("CHATPY_FILE_PUBLIC_SCHEME", "http")
+FILE_PUBLIC_HOST = os.getenv("CHATPY_FILE_PUBLIC_HOST")
+_FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 # ----------------- DB -----------------
 def _load_env_file():
@@ -145,6 +157,194 @@ def init_db_configs():
         "database": database,
         "auth_plugin": auth_plugin,
     }
+
+
+def _file_id_valid(file_id):
+    return bool(file_id and _FILE_ID_RE.match(file_id))
+
+
+def _file_data_path(file_id):
+    return FILE_STORAGE_DIR / f"{file_id}.bin"
+
+
+def _file_meta_path(file_id):
+    return FILE_STORAGE_DIR / f"{file_id}.json"
+
+
+def _file_public_url(file_id, request_host=None):
+    host = FILE_PUBLIC_HOST or request_host
+    if not host:
+        return f"/files/{file_id}"
+    return f"{FILE_PUBLIC_SCHEME}://{host}/files/{file_id}"
+
+
+def _cleanup_uploads(now=None):
+    now = now or time.time()
+    if not FILE_STORAGE_DIR.exists():
+        return
+    for meta_path in FILE_STORAGE_DIR.glob("*.json"):
+        try:
+            raw = meta_path.read_text(encoding="utf-8")
+            meta = json.loads(raw) if raw else {}
+        except Exception:
+            meta = {}
+        created_at = meta.get("created_at")
+        if not isinstance(created_at, (int, float)):
+            try:
+                created_at = meta_path.stat().st_mtime
+            except Exception:
+                created_at = now
+        if now - float(created_at) > FILE_TTL_SECONDS:
+            file_id = meta.get("file_id") or meta_path.stem
+            try:
+                _file_data_path(file_id).unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+class FileRequestHandler(BaseHTTPRequestHandler):
+    server_version = "ChatPyFileServer/1.0"
+
+    def log_message(self, fmt, *args):
+        # Keep file server logs quiet.
+        return
+
+    def _send_json(self, code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error(self, code, message):
+        self._send_json(code, {"status": "error", "error": message})
+
+    def do_POST(self):
+        if not self.path.startswith("/upload/"):
+            self._send_error(404, "Not found")
+            return
+
+        _cleanup_uploads()
+
+        file_id = self.path.split("/", 2)[-1].strip()
+        if not _file_id_valid(file_id):
+            self._send_error(400, "Invalid file_id")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_error(400, "Missing Content-Length")
+            return
+        if length > FILE_MAX_BYTES:
+            self._send_error(413, "File too large")
+            return
+
+        FILE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        data_path = _file_data_path(file_id)
+        tmp_path = data_path.with_suffix(".bin.tmp")
+        remaining = length
+        try:
+            with tmp_path.open("wb") as fh:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    remaining -= len(chunk)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._send_error(500, "Failed to store file")
+            return
+
+        if remaining != 0:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._send_error(400, "Incomplete upload")
+            return
+
+        try:
+            tmp_path.replace(data_path)
+        except Exception:
+            self._send_error(500, "Failed to finalize upload")
+            return
+
+        meta = {
+            "file_id": file_id,
+            "name": self.headers.get("X-File-Name", ""),
+            "size": int(self.headers.get("X-File-Size", "0") or 0),
+            "mime": self.headers.get("X-File-Mime", ""),
+            "sha256": self.headers.get("X-File-Sha256", ""),
+            "created_at": time.time(),
+        }
+        try:
+            _file_meta_path(file_id).write_text(json.dumps(meta), encoding="utf-8")
+        except Exception:
+            pass
+
+        url = _file_public_url(file_id, request_host=self.headers.get("Host"))
+        self._send_json(200, {"status": "ok", "file_id": file_id, "url": url})
+
+    def do_GET(self):
+        if not (self.path.startswith("/files/") or self.path.startswith("/download/")):
+            self._send_error(404, "Not found")
+            return
+
+        _cleanup_uploads()
+
+        file_id = self.path.split("/", 2)[-1].strip()
+        if not _file_id_valid(file_id):
+            self._send_error(400, "Invalid file_id")
+            return
+
+        data_path = _file_data_path(file_id)
+        if not data_path.is_file():
+            self._send_error(404, "Not found")
+            return
+
+        try:
+            size = data_path.stat().st_size
+        except Exception:
+            size = None
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        if size is not None:
+            self.send_header("Content-Length", str(size))
+        self.end_headers()
+        try:
+            with data_path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except Exception:
+            return
+
+
+def start_file_server():
+    FILE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _serve():
+        httpd = ThreadingHTTPServer((FILE_SERVER_HOST, FILE_SERVER_PORT), FileRequestHandler)
+        httpd.serve_forever()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return thread
 
 
 def get_db():
@@ -2478,6 +2678,7 @@ async def safe_write(writer, data):
 async def main():
     init_db_configs()
     ensure_schema()
+    start_file_server()
     ssl_ctx = build_server_ssl_context()
     server = await asyncio.start_server(
         handle_client, 
@@ -2489,6 +2690,8 @@ async def main():
     print("=" * 50)
     print("Server running on port 9999 (Max packet: 10MB)")
     print("Transport: TLS enabled" if ssl_ctx else "Transport: plaintext (TLS disabled)")
+    print(f"File server: {FILE_SERVER_HOST}:{FILE_SERVER_PORT} (dir={FILE_STORAGE_DIR})")
+    print(f"File limits: {FILE_MAX_BYTES // (1024 * 1024)}MB, TTL {FILE_TTL_SECONDS // 86400} days")
     print("Offline message delivery: ENABLED")
     print("Secure mode (anti-forensic): ENABLED")
     print("Secure session protocol: ENABLED")
