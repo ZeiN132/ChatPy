@@ -32,6 +32,7 @@ LOGIN_FAIL_DELAY = 1.5
 _reset_attempts = {}
 _login_attempts = {}
 DUMMY_PASSWORD_HASH = hashpw(b"chatpy_dummy_password", gensalt())
+GROUP_E2E_V2_ENABLED = False
 
 # ----------------- DB -----------------
 def _load_env_file():
@@ -114,11 +115,12 @@ def build_server_ssl_context():
 
 
 def init_db_configs():
-    global DB_RUNTIME_CONFIG, DB_MIGRATOR_CONFIG
+    global DB_RUNTIME_CONFIG, DB_MIGRATOR_CONFIG, GROUP_E2E_V2_ENABLED
     if DB_RUNTIME_CONFIG is not None and DB_MIGRATOR_CONFIG is not None:
         return
 
     _load_env_file()
+    GROUP_E2E_V2_ENABLED = _env_truthy(os.getenv("CHATPY_GROUP_E2E_V2", "0"))
 
     host = _require_env("CHATPY_DB_HOST")
     database = _require_env("CHATPY_DB_NAME")
@@ -254,6 +256,22 @@ def ensure_schema():
             INDEX idx_group_invites_user (invited_user, status)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS group_key_envelopes (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            group_id INT NOT NULL,
+            epoch_id VARCHAR(64) NOT NULL,
+            sender_username VARCHAR(64) NOT NULL,
+            sender_device_id VARCHAR(64) NOT NULL,
+            recipient_username VARCHAR(64) NOT NULL,
+            recipient_device_id VARCHAR(64) NOT NULL,
+            payload MEDIUMTEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_group_key_envelope_target (group_id, epoch_id, recipient_username, recipient_device_id),
+            INDEX idx_group_key_env_recipient (recipient_username, group_id, id),
+            INDEX idx_group_key_env_group_epoch (group_id, epoch_id)
+        )
+    """)
     cur.execute("SHOW COLUMNS FROM group_messages LIKE 'payload'")
     g_row = cur.fetchone()
     if g_row:
@@ -262,18 +280,19 @@ def ensure_schema():
             cur.execute("ALTER TABLE group_messages MODIFY payload MEDIUMTEXT")
         elif g_col_type in ("tinytext",):
             cur.execute("ALTER TABLE group_messages MODIFY payload MEDIUMTEXT")
-    cur.execute("""
-        SELECT id
-        FROM chat_groups
-        WHERE key_epoch IS NULL OR key_epoch = '' OR group_key IS NULL OR group_key = ''
-    """)
-    missing_crypto = cur.fetchall()
-    for row in missing_crypto:
-        group_id = row[0]
-        cur.execute(
-            "UPDATE chat_groups SET key_epoch=%s, group_key=%s WHERE id=%s",
-            (_new_group_epoch(), _new_group_key_b64(), group_id),
-        )
+    if not GROUP_E2E_V2_ENABLED:
+        cur.execute("""
+            SELECT id
+            FROM chat_groups
+            WHERE key_epoch IS NULL OR key_epoch = '' OR group_key IS NULL OR group_key = ''
+        """)
+        missing_crypto = cur.fetchall()
+        for row in missing_crypto:
+            group_id = row[0]
+            cur.execute(
+                "UPDATE chat_groups SET key_epoch=%s, group_key=%s WHERE id=%s",
+                (_new_group_epoch(), _new_group_key_b64(), group_id),
+            )
     conn.commit()
     cur.close()
     conn.close()
@@ -480,6 +499,13 @@ def _parse_group_id(raw_group_id):
     return gid if gid > 0 else None
 
 
+def _normalize_epoch_id(raw_epoch_id):
+    epoch_id = str(raw_epoch_id or "").strip()
+    if not epoch_id:
+        return None
+    return epoch_id[:64]
+
+
 def _row_to_group_info(row):
     if not isinstance(row, dict):
         return None
@@ -574,6 +600,222 @@ def get_group_members(group_id):
     return [r["username"] for r in rows if r.get("username")]
 
 
+def get_group_member_identity_keys(group_id):
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT
+            gm.username,
+            ik.device_id,
+            ik.sign_pub,
+            ik.dh_pub
+        FROM group_members gm
+        LEFT JOIN identity_keys ik ON ik.username = gm.username
+        WHERE gm.group_id = %s
+        ORDER BY gm.username ASC, ik.device_id ASC
+    """, (group_id,))
+    rows = cur.fetchall() or []
+    cur.close()
+    conn.close()
+    members = []
+    for row in rows:
+        username = str(row.get("username") or "").strip()
+        device_id = str(row.get("device_id") or "").strip()
+        sign_pub = row.get("sign_pub")
+        dh_pub = row.get("dh_pub")
+        if not username or not device_id or not sign_pub or not dh_pub:
+            continue
+        members.append({
+            "username": username,
+            "device_id": device_id,
+            "sign_pub": sign_pub,
+            "dh_pub": dh_pub,
+        })
+    return members
+
+
+def _load_group_members_tx(cur, group_id):
+    cur.execute("""
+        SELECT username
+        FROM group_members
+        WHERE group_id = %s
+    """, (group_id,))
+    rows = cur.fetchall() or []
+    members = set()
+    for row in rows:
+        if isinstance(row, dict):
+            username = row.get("username")
+        elif isinstance(row, (list, tuple)):
+            username = row[0] if row else None
+        else:
+            username = row
+        username = str(username or "").strip()
+        if username:
+            members.add(username)
+    return members
+
+
+def upsert_group_key_envelopes_tx(cur, group_id, epoch_id, sender_username, sender_device_id, envelopes):
+    epoch = _normalize_epoch_id(epoch_id)
+    sender = str(sender_username or "").strip()
+    sender_device = str(sender_device_id or "").strip()[:64]
+    if not epoch:
+        raise ValueError("epoch_id is required")
+    if not sender_device:
+        raise ValueError("sender_device_id is required")
+    if not isinstance(envelopes, list) or not envelopes:
+        raise ValueError("envelopes must be a non-empty list")
+
+    members = _load_group_members_tx(cur, group_id)
+    if sender not in members:
+        raise ValueError("You are not a member of this group")
+
+    saved = 0
+    for entry in envelopes:
+        if not isinstance(entry, dict):
+            continue
+        recipient_username = str(
+            entry.get("recipient_username")
+            or entry.get("recipient")
+            or ""
+        ).strip()
+        recipient_device_id = str(
+            entry.get("recipient_device_id")
+            or entry.get("recipient_device")
+            or entry.get("device_id")
+            or ""
+        ).strip()[:64]
+        payload = entry.get("payload")
+        if payload is None:
+            payload = {
+                "envelope": {
+                    k: v for k, v in entry.items()
+                    if k not in {
+                        "recipient_username",
+                        "recipient",
+                        "recipient_device_id",
+                        "recipient_device",
+                        "device_id",
+                    }
+                }
+            }
+        if not recipient_username or not recipient_device_id:
+            continue
+        if recipient_username not in members:
+            raise ValueError(f"Recipient '{recipient_username}' is not a group member")
+        if not isinstance(payload, dict):
+            raise ValueError("Envelope payload must be a JSON object")
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        cur.execute("""
+            INSERT INTO group_key_envelopes (
+                group_id,
+                epoch_id,
+                sender_username,
+                sender_device_id,
+                recipient_username,
+                recipient_device_id,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                sender_username = VALUES(sender_username),
+                sender_device_id = VALUES(sender_device_id),
+                payload = VALUES(payload),
+                created_at = CURRENT_TIMESTAMP
+        """, (
+            group_id,
+            epoch,
+            sender,
+            sender_device,
+            recipient_username,
+            recipient_device_id,
+            payload_json,
+        ))
+        saved += 1
+
+    if saved == 0:
+        raise ValueError("No valid envelopes were provided")
+    return saved
+
+
+def get_group_key_envelopes_for_user(username, group_id, epoch_id=None, since_id=None, limit=500):
+    group_id = _parse_group_id(group_id)
+    if not group_id:
+        return []
+    epoch = _normalize_epoch_id(epoch_id) if epoch_id is not None else None
+    if since_id is not None:
+        try:
+            since = int(since_id)
+        except (TypeError, ValueError):
+            since = None
+    else:
+        since = None
+    try:
+        lim = int(limit)
+    except (TypeError, ValueError):
+        lim = 500
+    lim = max(1, min(lim, 1000))
+
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+    query = """
+        SELECT
+            id,
+            group_id,
+            epoch_id,
+            sender_username,
+            sender_device_id,
+            recipient_username,
+            recipient_device_id,
+            payload
+        FROM group_key_envelopes
+        WHERE recipient_username = %s AND group_id = %s
+    """
+    params = [username, group_id]
+    if epoch:
+        query += " AND epoch_id = %s"
+        params.append(epoch)
+    if since is not None and since > 0:
+        query += " AND id > %s"
+        params.append(since)
+    query += " ORDER BY id ASC LIMIT %s"
+    params.append(lim)
+    cur.execute(query, tuple(params))
+    rows = cur.fetchall() or []
+    cur.close()
+    conn.close()
+
+    envelopes = []
+    for row in rows:
+        payload_raw = row.get("payload")
+        try:
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+        except Exception:
+            payload = {"raw": payload_raw}
+        envelopes.append({
+            "id": row.get("id"),
+            "group_id": row.get("group_id"),
+            "epoch_id": row.get("epoch_id"),
+            "sender_username": row.get("sender_username"),
+            "sender_device_id": row.get("sender_device_id"),
+            "recipient_username": row.get("recipient_username"),
+            "recipient_device_id": row.get("recipient_device_id"),
+            "payload": payload,
+        })
+    return envelopes
+
+
+def delete_group_key_envelopes_for_group_tx(cur, group_id):
+    cur.execute("DELETE FROM group_key_envelopes WHERE group_id = %s", (group_id,))
+
+
+def delete_group_key_envelopes_for_recipient_tx(cur, group_id, username):
+    cur.execute(
+        "DELETE FROM group_key_envelopes WHERE group_id = %s AND recipient_username = %s",
+        (group_id, username),
+    )
+
+
 def rotate_group_key_tx(cur, group_id):
     epoch = _new_group_epoch()
     group_key = _new_group_key_b64()
@@ -632,7 +874,8 @@ def get_pending_group_invites(username):
 async def push_group_snapshot(username, writer):
     await safe_write(writer, {
         "type": "groups",
-        "groups": get_user_groups(username)
+        "groups": get_user_groups(username),
+        "group_e2e_v2": GROUP_E2E_V2_ENABLED,
     })
     invites = get_pending_group_invites(username)
     if invites:
@@ -640,6 +883,25 @@ async def push_group_snapshot(username, writer):
             "type": "group_invites",
             "invites": invites
         })
+
+
+async def broadcast_group_rekey_required(group_id, members, reason, actor=None, epoch_id=None):
+    group_id = _parse_group_id(group_id)
+    if not group_id:
+        return
+    members = members if isinstance(members, list) else []
+    reason_text = str(reason or "rekey_required").strip() or "rekey_required"
+    for member in members:
+        if member in clients:
+            event = {
+                "type": "group_rekey_required",
+                "group_id": group_id,
+                "reason": reason_text,
+                "by": actor,
+            }
+            if epoch_id:
+                event["key_epoch"] = epoch_id
+            await safe_write(clients[member], event)
 
 
 # ----------------- SERVER -----------------
@@ -983,7 +1245,8 @@ async def handle_client(reader, writer):
             elif mtype == "get_groups" and user:
                 await safe_write(writer, {
                     "type": "groups",
-                    "groups": get_user_groups(user)
+                    "groups": get_user_groups(user),
+                    "group_e2e_v2": GROUP_E2E_V2_ENABLED,
                 })
 
             # ---------- GET GROUP INVITES ----------
@@ -1012,8 +1275,8 @@ async def handle_client(reader, writer):
                 invite_events = []
                 group_id = None
                 group_uuid = None
-                group_epoch = _new_group_epoch()
-                group_key = _new_group_key_b64()
+                group_epoch = None if GROUP_E2E_V2_ENABLED else _new_group_epoch()
+                group_key = None if GROUP_E2E_V2_ENABLED else _new_group_key_b64()
                 try:
                     if members:
                         placeholders = ", ".join(["%s"] * len(members))
@@ -1269,7 +1532,8 @@ async def handle_client(reader, writer):
                             SET status = 'accepted', responded_at = NOW()
                             WHERE id = %s
                         """, (invite_id,))
-                        rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
+                        if not GROUP_E2E_V2_ENABLED:
+                            rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
                     else:
                         cur.execute("""
                             UPDATE group_invites
@@ -1316,7 +1580,14 @@ async def handle_client(reader, writer):
                                 "group_id": group_id,
                                 "username": user
                             })
-                    if rotated_epoch and rotated_key:
+                    if GROUP_E2E_V2_ENABLED:
+                        await broadcast_group_rekey_required(
+                            group_id,
+                            members,
+                            reason="rekey_required_member_added",
+                            actor=user,
+                        )
+                    elif rotated_epoch and rotated_key:
                         for member in members:
                             if member in clients:
                                 await safe_write(clients[member], {
@@ -1389,6 +1660,7 @@ async def handle_client(reader, writer):
                         DELETE FROM group_invites
                         WHERE group_id = %s AND invited_user = %s AND status = 'pending'
                     """, (group_id, user))
+                    delete_group_key_envelopes_for_recipient_tx(cur, group_id, user)
 
                     cur.execute("""
                         SELECT username
@@ -1400,6 +1672,7 @@ async def handle_client(reader, writer):
                     remaining_members = [r.get("username") for r in remaining_rows if r.get("username")]
 
                     if not remaining_members:
+                        delete_group_key_envelopes_for_group_tx(cur, group_id)
                         cur.execute("DELETE FROM group_invites WHERE group_id = %s", (group_id,))
                         cur.execute("DELETE FROM group_messages WHERE group_id = %s", (group_id,))
                         cur.execute("DELETE FROM chat_groups WHERE id = %s", (group_id,))
@@ -1411,9 +1684,11 @@ async def handle_client(reader, writer):
                             SET role = CASE WHEN username = %s THEN 'owner' ELSE 'member' END
                             WHERE group_id = %s
                         """, (new_owner, group_id))
-                        rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
+                        if not GROUP_E2E_V2_ENABLED:
+                            rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
                     else:
-                        rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
+                        if not GROUP_E2E_V2_ENABLED:
+                            rotated_epoch, rotated_key = rotate_group_key_tx(cur, group_id)
 
                     conn.commit()
                 except Error as e:
@@ -1442,7 +1717,14 @@ async def handle_client(reader, writer):
                             "username": user,
                             "new_owner": new_owner
                         })
-                if rotated_epoch and rotated_key:
+                if GROUP_E2E_V2_ENABLED and remaining_members:
+                    await broadcast_group_rekey_required(
+                        group_id,
+                        remaining_members,
+                        reason="rekey_required_member_left",
+                        actor=user,
+                    )
+                elif rotated_epoch and rotated_key:
                     for member in remaining_members:
                         if member in clients:
                             await safe_write(clients[member], {
@@ -1499,6 +1781,7 @@ async def handle_client(reader, writer):
                     rows = cur.fetchall()
                     members = [r.get("username") for r in rows if r.get("username")]
 
+                    delete_group_key_envelopes_for_group_tx(cur, group_id)
                     cur.execute("DELETE FROM group_invites WHERE group_id = %s", (group_id,))
                     cur.execute("DELETE FROM group_messages WHERE group_id = %s", (group_id,))
                     cur.execute("DELETE FROM group_members WHERE group_id = %s", (group_id,))
@@ -1649,6 +1932,169 @@ async def handle_client(reader, writer):
                     "type": "group_history",
                     "group_id": group_id,
                     "messages": rows
+                })
+
+            # ---------- GROUP KEYS FOR E2E WRAP ----------
+            elif mtype == "get_group_member_keys" and user:
+                group_id = _parse_group_id(msg.get("group_id"))
+                if not group_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_member_keys",
+                        "error": "group_id is required"
+                    })
+                    continue
+                if not is_group_member(user, group_id):
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_member_keys",
+                        "error": "You are not a member of this group"
+                    })
+                    continue
+                members = get_group_member_identity_keys(group_id)
+                await safe_write(writer, {
+                    "type": "group_member_keys",
+                    "group_id": group_id,
+                    "members": members,
+                })
+
+            # ---------- GROUP E2E: PUBLISH EPOCH ----------
+            elif mtype == "group_publish_epoch" and user:
+                if not GROUP_E2E_V2_ENABLED:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_publish_epoch",
+                        "error": "Group E2E v2 is disabled on this server"
+                    })
+                    continue
+                group_id = _parse_group_id(msg.get("group_id"))
+                epoch_id = _normalize_epoch_id(msg.get("epoch_id"))
+                sender_device_id = str(msg.get("sender_device_id") or "").strip()
+                envelopes = msg.get("envelopes")
+                reason = str(msg.get("reason") or "").strip() or "envelopes_published"
+                if not group_id or not epoch_id or not sender_device_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_publish_epoch",
+                        "error": "group_id, epoch_id and sender_device_id are required"
+                    })
+                    continue
+
+                conn = get_db()
+                cur = conn.cursor(dictionary=True)
+                envelope_count = 0
+                members = []
+                try:
+                    cur.execute("""
+                        SELECT 1
+                        FROM group_members
+                        WHERE group_id = %s AND username = %s
+                        LIMIT 1
+                    """, (group_id, user))
+                    if not cur.fetchone():
+                        await safe_write(writer, {
+                            "type": "group_error",
+                            "op": "group_publish_epoch",
+                            "error": "You are not a member of this group"
+                        })
+                        continue
+
+                    envelope_count = upsert_group_key_envelopes_tx(
+                        cur,
+                        group_id,
+                        epoch_id,
+                        user,
+                        sender_device_id,
+                        envelopes,
+                    )
+                    cur.execute(
+                        "UPDATE chat_groups SET key_epoch = %s, group_key = NULL WHERE id = %s",
+                        (epoch_id, group_id),
+                    )
+                    cur.execute("""
+                        SELECT username
+                        FROM group_members
+                        WHERE group_id = %s
+                    """, (group_id,))
+                    members = [r.get("username") for r in cur.fetchall() if r.get("username")]
+                    conn.commit()
+                except ValueError as e:
+                    conn.rollback()
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_publish_epoch",
+                        "error": str(e)
+                    })
+                    continue
+                except Error as e:
+                    conn.rollback()
+                    print(f"[GROUP E2E PUBLISH ERROR] {e}")
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "group_publish_epoch",
+                        "error": "Failed to publish group epoch"
+                    })
+                    continue
+                finally:
+                    cur.close()
+                    conn.close()
+
+                await safe_write(writer, {
+                    "type": "group_epoch_published",
+                    "status": "ok",
+                    "group_id": group_id,
+                    "epoch_id": epoch_id,
+                    "envelope_count": envelope_count
+                })
+                for member in members:
+                    if member in clients:
+                        await safe_write(clients[member], {
+                            "type": "group_key_envelopes_available",
+                            "group_id": group_id,
+                            "epoch_id": epoch_id,
+                            "reason": reason,
+                            "from": user
+                        })
+
+            # ---------- GROUP E2E: GET ENVELOPES ----------
+            elif mtype == "get_group_key_envelopes" and user:
+                if not GROUP_E2E_V2_ENABLED:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_key_envelopes",
+                        "error": "Group E2E v2 is disabled on this server"
+                    })
+                    continue
+                group_id = _parse_group_id(msg.get("group_id"))
+                epoch_id = _normalize_epoch_id(msg.get("epoch_id")) if msg.get("epoch_id") is not None else None
+                since_id = msg.get("since_id")
+                limit = msg.get("limit", 500)
+                if not group_id:
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_key_envelopes",
+                        "error": "group_id is required"
+                    })
+                    continue
+                if not is_group_member(user, group_id):
+                    await safe_write(writer, {
+                        "type": "group_error",
+                        "op": "get_group_key_envelopes",
+                        "error": "You are not a member of this group"
+                    })
+                    continue
+                envelopes = get_group_key_envelopes_for_user(
+                    user,
+                    group_id,
+                    epoch_id=epoch_id,
+                    since_id=since_id,
+                    limit=limit,
+                )
+                await safe_write(writer, {
+                    "type": "group_key_envelopes",
+                    "group_id": group_id,
+                    "epoch_id": epoch_id,
+                    "envelopes": envelopes
                 })
 
             # ---------- SECURE SESSION REQUEST ----------
@@ -2045,6 +2491,7 @@ async def main():
     print("Offline message delivery: ENABLED")
     print("Secure mode (anti-forensic): ENABLED")
     print("Secure session protocol: ENABLED")
+    print("Group E2E envelopes: ENABLED (v2)" if GROUP_E2E_V2_ENABLED else "Group E2E envelopes: disabled (legacy group_key mode)")
     print("=" * 50)
     async with server:
         await server.serve_forever()

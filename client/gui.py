@@ -1235,14 +1235,16 @@ class CustomDeleteDialog(QFrame):
     def __init__(self, parent, msg_id, on_confirm, show_for_all=True):
         super().__init__(parent)
         self.setObjectName("ConfirmDialog")
-        self.setFixedSize(320, 180)
+        dialog_w = 340
+        dialog_h = 178 if show_for_all else 142
+        self.setFixedSize(dialog_w, dialog_h)
         self.on_confirm = on_confirm
         self.msg_id = msg_id
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
 
         label = QLabel("Delete message?")
         label.setStyleSheet("font-size: 18px; font-weight: bold; border: none; background: transparent;")
@@ -1251,10 +1253,9 @@ class CustomDeleteDialog(QFrame):
         self.checkbox = QCheckBox("Delete for everyone")
         self.checkbox.setChecked(True)
         self.checkbox.setStyleSheet("border: none; background: transparent; font-size: 13px;")
-        if not show_for_all:
-            self.checkbox.hide()
 
         btn_lay = QHBoxLayout()
+        btn_lay.setSpacing(10)
         self.yes_btn = QPushButton("DELETE")
         self.yes_btn.setObjectName("danger")
         self.no_btn = QPushButton("CANCEL")
@@ -1264,8 +1265,8 @@ class CustomDeleteDialog(QFrame):
         btn_lay.addWidget(self.no_btn)
 
         layout.addWidget(label)
-        layout.addStretch()
-        layout.addWidget(self.checkbox)
+        if show_for_all:
+            layout.addWidget(self.checkbox)
         layout.addLayout(btn_lay)
 
         self.no_btn.clicked.connect(self.cancel)
@@ -2052,6 +2053,9 @@ class ChatWindow(QWidget):
 
         self.secure_sessions = {}
         self.secure_pending = set()
+        self._secure_pending_tokens = {}
+        self._secure_simultaneous = set()
+        self._secure_handshake_timeout_ms = 30000
         self._incoming_files = {}
         self._file_chunk_size = 32 * 1024
         self.identity_pins = IdentityPinStore(
@@ -2110,6 +2114,14 @@ class ChatWindow(QWidget):
 
         header_layout.addWidget(self.chat_title)
         header_layout.addStretch()
+        self.end_secure_btn = QPushButton("End Secure")
+        self.end_secure_btn.setObjectName("danger")
+        self.end_secure_btn.setToolTip(
+            "End secure session and delete secure messages for both users."
+        )
+        self.end_secure_btn.hide()
+        self.end_secure_btn.clicked.connect(self.on_end_secure_session)
+        header_layout.addWidget(self.end_secure_btn)
 
         self.key_banner = QFrame()
         self.key_banner.setObjectName("keyBanner")
@@ -2381,7 +2393,7 @@ class ChatWindow(QWidget):
         if not peer:
             return
         self.blocked_peers.add(peer)
-        self.secure_pending.discard(peer)
+        self._clear_secure_pending(peer)
         self.secure_sessions[peer] = False
         self.net.clear_session(peer)
         self.net.clear_normal_session(peer)
@@ -3075,6 +3087,74 @@ class ChatWindow(QWidget):
             return False
         return self.secure_sessions.get(self.peer, False)
 
+    def _is_secure_initiator(self, peer):
+        local = str(self.username or "").strip().lower()
+        remote = str(peer or "").strip().lower()
+        if not local or not remote:
+            return True
+        if local == remote:
+            return True
+        return local < remote
+
+    def _clear_secure_pending(self, peer):
+        if not peer:
+            return
+        self.secure_pending.discard(peer)
+        self._secure_pending_tokens.pop(peer, None)
+        self._secure_simultaneous.discard(peer)
+
+    def _mark_secure_pending(self, peer):
+        if not peer:
+            return
+        self.secure_pending.add(peer)
+        token = base64.urlsafe_b64encode(os.urandom(6)).decode("ascii").rstrip("=")
+        self._secure_pending_tokens[peer] = token
+        if self.peer == peer:
+            self.update_secure_ui()
+        QTimer.singleShot(
+            self._secure_handshake_timeout_ms,
+            lambda p=peer, t=token: self._expire_secure_pending(p, t)
+        )
+
+    def _expire_secure_pending(self, peer, token):
+        if not peer:
+            return
+        if self._secure_pending_tokens.get(peer) != token:
+            return
+        if peer not in self.secure_pending:
+            return
+        if self.secure_sessions.get(peer, False):
+            self._clear_secure_pending(peer)
+            return
+        session = self.net.sessions.get(peer)
+        if isinstance(session, dict) and session.get("established"):
+            self.enable_secure_session(peer)
+            return
+
+        self.net.clear_session(peer)
+        self.secure_sessions[peer] = False
+        self._clear_secure_pending(peer)
+        if self.peer == peer:
+            self.update_secure_ui()
+            self.show_key_banner("Secure session timed out. Start it again.", timeout_ms=10000)
+        print(f"[SECURE] Session timeout with {peer}")
+
+    def _start_secure_key_exchange(self, peer, initiator=True):
+        if not peer:
+            return
+        has_pending = self.net.has_pending_exchange(peer)
+        self.net.clear_session(peer, keep_pending=has_pending)
+        processed = self.net.approve_secure_session(peer)
+        session = self.net.sessions.get(peer)
+        if isinstance(session, dict) and session.get("established"):
+            self.enable_secure_session(peer)
+            return
+        if processed and not initiator:
+            return
+        # Fallback: pending packet existed but did not establish a session.
+        # Start local exchange to avoid hanging in "establishing".
+        self.net.start_secure_session(peer, initiator=initiator)
+
     def _payload_is_secure(self, payload):
         if not isinstance(payload, dict):
             return False
@@ -3125,24 +3205,39 @@ class ChatWindow(QWidget):
         self._start_secure_session_request(self.peer)
 
     def _start_secure_session_request(self, peer):
+        if not peer:
+            return
         self.net.request_identity_keys(peer)
-        self.net.clear_session(peer)
+        has_pending = self.net.has_pending_exchange(peer)
+        self.net.clear_session(peer, keep_pending=has_pending)
+        self._secure_simultaneous.discard(peer)
         self.net.send({
             "type": "secure_session_request",
             "peer": peer
         })
-        self.secure_pending.add(peer)
+        self._mark_secure_pending(peer)
         self.net.approve_secure_session(peer)
-        # Initiator should start key exchange immediately to avoid race.
-        self.net.start_secure_session(peer, initiator=True)
 
     def show_secure_session_request(self, peer):
-        if self.is_secure_session_active() or peer in self.secure_pending:
+        if self.secure_sessions.get(peer, False):
             self.net.send({
                 "type": "secure_session_response",
                 "peer": peer,
                 "accepted": False
             })
+            return
+        if peer in self.secure_pending:
+            # Simultaneous handshake: auto-accept and elect a single initiator.
+            self._secure_simultaneous.add(peer)
+            self.net.send({
+                "type": "secure_session_response",
+                "peer": peer,
+                "accepted": True
+            })
+            self._mark_secure_pending(peer)
+            self.net.approve_secure_session(peer)
+            if self._is_secure_initiator(peer):
+                self._start_secure_key_exchange(peer, initiator=True)
             return
         self.net.request_identity_keys(peer)
         if self.is_peer_blocked(peer):
@@ -3207,10 +3302,10 @@ class ChatWindow(QWidget):
         # Preserve a pending exchange if it already arrived.
         has_pending = self.net.has_pending_exchange(peer)
         self.net.clear_session(peer, keep_pending=has_pending)
-        self.secure_pending.add(peer)
+        self._mark_secure_pending(peer)
         processed = self.net.approve_secure_session(peer)
         if not processed:
-            self.net.start_secure_session(peer, initiator=False)
+            print(f"[SECURE] Waiting for key exchange from {peer}")
         
         QMessageBox.information(
             self,
@@ -3226,7 +3321,7 @@ class ChatWindow(QWidget):
             "accepted": False
         })
         self.net.clear_session(peer)
-        self.secure_pending.discard(peer)
+        self._clear_secure_pending(peer)
         self.secure_sessions[peer] = False
         if self.peer == peer:
             self.update_secure_ui()
@@ -3239,8 +3334,12 @@ class ChatWindow(QWidget):
 
     def on_secure_session_response(self, peer, accepted):
         if accepted:
-            # Session key exchange already started on request.
-            self.secure_pending.add(peer)
+            self._mark_secure_pending(peer)
+            should_start = True
+            if peer in self._secure_simultaneous:
+                should_start = self._is_secure_initiator(peer)
+            if should_start:
+                self._start_secure_key_exchange(peer, initiator=True)
             QMessageBox.information(
                 self,
                 "Secure Session Started",
@@ -3249,7 +3348,7 @@ class ChatWindow(QWidget):
             )
         else:
             self.net.clear_session(peer)
-            self.secure_pending.discard(peer)
+            self._clear_secure_pending(peer)
             self.secure_sessions[peer] = False
             if self.peer == peer:
                 self.update_secure_ui()
@@ -3262,9 +3361,8 @@ class ChatWindow(QWidget):
     def enable_secure_session(self, peer):
         self.secure_sessions[peer] = True
         self.forensic.enable_secure_mode()
-        if peer in self.secure_pending:
-            self.secure_pending.discard(peer)
-        
+        self._clear_secure_pending(peer)
+
         if self.peer == peer:
             self.update_secure_ui()
 
@@ -3272,7 +3370,7 @@ class ChatWindow(QWidget):
         if self.is_peer_blocked(peer):
             self.net.clear_session(peer)
             self.secure_sessions[peer] = False
-            self.secure_pending.discard(peer)
+            self._clear_secure_pending(peer)
             if self.peer == peer:
                 self.update_secure_ui()
             return
@@ -3281,9 +3379,9 @@ class ChatWindow(QWidget):
     def disable_secure_session(self):
         if not self.peer:
             return
-        
+
         self.secure_sessions[self.peer] = False
-        self.secure_pending.discard(self.peer)
+        self._clear_secure_pending(self.peer)
         self.net.clear_session(self.peer)
         self.forensic.disable_secure_mode()
         
@@ -3309,8 +3407,36 @@ class ChatWindow(QWidget):
         else:
             self.secure_indicator.setText("")
             self.secure_indicator.hide()
+
+        show_end_secure = bool(
+            self.current_chat_kind == "peer"
+            and self.peer
+            and self.secure_sessions.get(self.peer, False)
+        )
+        if show_end_secure:
+            self.end_secure_btn.show()
+            self.end_secure_btn.setEnabled(True)
+        else:
+            self.end_secure_btn.hide()
+
         if hasattr(self, "settings_panel"):
             self.settings_panel.update_secure_toggle()
+
+    def on_end_secure_session(self):
+        if self.current_chat_kind != "peer" or not self.peer:
+            return
+        if not self.secure_sessions.get(self.peer, False):
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "End Secure Session",
+            "End secure session for both users and delete secure messages?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.close_secure_chat(self.peer)
 
     def _refresh_history_if_needed(self, peer):
         if self.peer == peer and not self.is_secure_session_active() and peer not in self.secure_pending:
@@ -3375,7 +3501,7 @@ class ChatWindow(QWidget):
             self.secure_storage.clear_peer_messages(peer, self.forensic)
             self.forensic.secure_wipe_memory()
             self.secure_sessions[peer] = False
-            self.secure_pending.discard(peer)
+            self._clear_secure_pending(peer)
             if self.peer == peer:
                 self.update_secure_ui()
                 self._refresh_history_if_needed(peer)
@@ -3391,7 +3517,7 @@ class ChatWindow(QWidget):
                 self.forensic
             )
             self.secure_sessions[peer] = False
-            self.secure_pending.discard(peer)
+            self._clear_secure_pending(peer)
             if self.peer == peer:
                 self.clear_chat()
                 self.update_secure_ui()
@@ -3610,10 +3736,16 @@ class ChatWindow(QWidget):
             sender_name=None if entry["mine"] else entry.get("sender"),
         )
 
-    def _decode_group_payload(self, group_id, payload, source="live"):
+    def _decode_group_payload(self, group_id, payload, sender=None, source="live"):
         if isinstance(payload, dict) and payload.get("purpose") == "group_v1":
             try:
-                decoded = self.net.decrypt_group_payload(group_id, payload)
+                require_sig = source in ("live", "sent")
+                decoded = self.net.decrypt_group_payload(
+                    group_id,
+                    payload,
+                    sender_username=sender,
+                    require_sig=require_sig,
+                )
             except Exception:
                 return "Group message (decryption failed)"
         else:
@@ -4039,7 +4171,7 @@ class ChatWindow(QWidget):
             self.finish_delete,
             show_for_all=not is_group_chat,
         )
-        dialog.move((self.width()-320)//2, (self.height()-180)//2)
+        dialog.move((self.width() - dialog.width()) // 2, (self.height() - dialog.height()) // 2)
         dialog.show()
 
     def finish_delete(self, msg_id, for_all):
@@ -4081,8 +4213,12 @@ class ChatWindow(QWidget):
             return
 
         if self.peer in self.secure_pending and not self.is_secure_session_active():
-            QMessageBox.warning(self, "Error", "Secure session is establishing. Try again in a moment.")
-            return
+            session = self.net.sessions.get(self.peer)
+            if isinstance(session, dict) and session.get("established"):
+                self.enable_secure_session(self.peer)
+            else:
+                QMessageBox.warning(self, "Error", "Secure session is establishing. Try again in a moment.")
+                return
         secure_mode = self.is_secure_session_active()
         if secure_mode:
             if self.is_peer_blocked(self.peer):
@@ -4123,7 +4259,7 @@ class ChatWindow(QWidget):
         if gid is None:
             return
         if self.current_chat_kind == "group" and self.current_group_id == gid:
-            decoded = self._decode_group_payload(gid, payload, source="sent")
+            decoded = self._decode_group_payload(gid, payload, sender=self.username, source="sent")
             if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
                 # Outgoing group file is already rendered locally in _send_group_file_in_chunks.
                 return
@@ -4142,7 +4278,7 @@ class ChatWindow(QWidget):
                 members.add(sender)
                 group["members"] = sorted(members)
         if self.current_chat_kind == "group" and self.current_group_id == gid:
-            decoded = self._decode_group_payload(gid, payload, source="live")
+            decoded = self._decode_group_payload(gid, payload, sender=sender, source="live")
             if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
                 self._handle_group_file_chunk(gid, sender, decoded, False, source="live")
                 return
@@ -4158,7 +4294,7 @@ class ChatWindow(QWidget):
         for m in messages:
             sender = m.get("sender")
             mine = sender == self.username
-            decoded = self._decode_group_payload(gid, m.get("payload"), source="history")
+            decoded = self._decode_group_payload(gid, m.get("payload"), sender=sender, source="history")
             if isinstance(decoded, dict) and decoded.get("type") == "file_chunk":
                 self._handle_group_file_chunk(gid, sender, decoded, mine, source="history")
                 continue

@@ -88,6 +88,12 @@ class ClientNetwork:
         )
         self.username = None
         self.group_sessions = {}
+        self.group_key_envelopes = {}
+        self.group_meta = {}
+        self.group_member_keys = {}
+        self._group_publish_pending = {}
+        self._group_rekey_required = set()
+        self.group_e2e_v2_enabled = False
         self._rekey_after = 100
 
     def _notify_storage_warning(self, message):
@@ -173,8 +179,29 @@ class ClientNetwork:
                     continue
                 if msg_type == "identity_keys_set":
                     continue
+                if msg_type == "group_epoch_published":
+                    try:
+                        gid = self._normalize_group_id(msg.get("group_id"))
+                        epoch_id = str(msg.get("epoch_id") or "").strip()
+                        if gid is not None:
+                            pending = self._group_publish_pending.get(gid)
+                            if isinstance(pending, dict) and pending.get("epoch_id") == epoch_id:
+                                pending["state"] = "confirmed"
+                                pending["confirmed_at"] = time.time()
+                                self._group_publish_pending[gid] = pending
+                            self._group_rekey_required.discard(gid)
+                            self.request_group_key_envelopes(gid, epoch_id=epoch_id)
+                    except Exception:
+                        pass
+                    continue
+                if msg_type == "group_member_keys":
+                    try:
+                        self._handle_group_member_keys(msg)
+                    except Exception:
+                        pass
+                    continue
 
-                if status == "ok" or status == "error":
+                if (status == "ok" or status == "error") and msg_type in ("auth", "register", "login"):
                     if msg.get("auth_stage") == "register":
                         self.signals.register.emit(msg)
                         continue
@@ -183,6 +210,11 @@ class ClientNetwork:
                         new_user = msg["username"]
                         if self.username != new_user:
                             self.group_sessions = {}
+                            self.group_meta = {}
+                            self.group_member_keys = {}
+                            self.group_key_envelopes = {}
+                            self._group_publish_pending = {}
+                            self._group_rekey_required = set()
                         self.username = new_user
                     self.signals.auth.emit(msg)
                     if "users" in msg:
@@ -248,9 +280,11 @@ class ClientNetwork:
 
                 elif msg_type == "groups":
                     try:
+                        self.group_e2e_v2_enabled = bool(msg.get("group_e2e_v2", False))
                         groups = msg.get("groups", [])
                         if isinstance(groups, list):
                             for group_obj in groups:
+                                self._update_group_meta(group_obj)
                                 self.ingest_group_crypto(group_obj)
                         self.signals.groups.emit(groups if isinstance(groups, list) else [])
                     except Exception:
@@ -259,7 +293,16 @@ class ClientNetwork:
                 elif msg_type == "group_created":
                     try:
                         group_obj = msg.get("group", {})
+                        self._update_group_meta(group_obj)
                         self.ingest_group_crypto(group_obj)
+                        if self.group_e2e_v2_enabled:
+                            gid = self._normalize_group_id(group_obj.get("group_id") if isinstance(group_obj, dict) else None)
+                            if gid is not None and self._is_group_owner(gid):
+                                self.ensure_group_epoch_published(
+                                    gid,
+                                    reason="group_created",
+                                    force_new=True,
+                                )
                         self.signals.group_created.emit(group_obj if isinstance(group_obj, dict) else {})
                     except Exception:
                         pass
@@ -346,7 +389,13 @@ class ClientNetwork:
                 elif msg_type == "group_left":
                     try:
                         group_id = msg.get("group_id")
-                        self.clear_group_session(group_id)
+                        gid = self._normalize_group_id(group_id)
+                        self.clear_group_session(gid)
+                        if gid is not None:
+                            self.group_meta.pop(gid, None)
+                            self.group_member_keys.pop(gid, None)
+                            self._group_publish_pending.pop(gid, None)
+                            self._group_rekey_required.discard(gid)
                         self.signals.group_left.emit(group_id)
                     except Exception:
                         pass
@@ -354,7 +403,13 @@ class ClientNetwork:
                 elif msg_type == "group_deleted":
                     try:
                         group_id = msg.get("group_id")
-                        self.clear_group_session(group_id)
+                        gid = self._normalize_group_id(group_id)
+                        self.clear_group_session(gid)
+                        if gid is not None:
+                            self.group_meta.pop(gid, None)
+                            self.group_member_keys.pop(gid, None)
+                            self._group_publish_pending.pop(gid, None)
+                            self._group_rekey_required.discard(gid)
                         self.signals.group_deleted.emit(msg)
                     except Exception:
                         pass
@@ -367,7 +422,52 @@ class ClientNetwork:
                             msg.get("group_key"),
                             set_current=True,
                         )
+                        gid = self._normalize_group_id(msg.get("group_id"))
+                        if gid is not None:
+                            self._group_rekey_required.discard(gid)
+                            self._update_group_meta({
+                                "group_id": gid,
+                                "key_epoch": msg.get("key_epoch"),
+                                "group_key": msg.get("group_key"),
+                            })
                         self.signals.group_key_update.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_rekey_required":
+                    try:
+                        gid = self._normalize_group_id(msg.get("group_id"))
+                        if gid is not None:
+                            self._group_rekey_required.add(gid)
+                            if self.group_e2e_v2_enabled and self._is_group_owner(gid):
+                                self.ensure_group_epoch_published(
+                                    gid,
+                                    reason=msg.get("reason") or "rekey_required",
+                                    force_new=True,
+                                )
+                            else:
+                                self.request_group_key_envelopes(gid, epoch_id=msg.get("key_epoch"))
+                        self.signals.group_key_update.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_key_envelopes_available":
+                    try:
+                        gid = self._normalize_group_id(msg.get("group_id"))
+                        if gid is not None:
+                            self.request_group_key_envelopes(gid, epoch_id=msg.get("epoch_id"))
+                        self.signals.group_key_update.emit(msg)
+                    except Exception:
+                        pass
+
+                elif msg_type == "group_key_envelopes":
+                    try:
+                        gid = self._normalize_group_id(msg.get("group_id"))
+                        if gid is not None:
+                            envelopes = msg.get("envelopes", [])
+                            if isinstance(envelopes, list):
+                                self.group_key_envelopes[gid] = envelopes
+                                self._ingest_group_key_envelopes(gid, envelopes)
                     except Exception:
                         pass
 
@@ -404,6 +504,547 @@ class ClientNetwork:
         if gid is None or not epoch_id:
             return None
         return f"chatpy-group-v1|{gid}|{epoch_id}".encode("utf-8")
+
+    def _new_group_epoch_id(self):
+        return base64.urlsafe_b64encode(os.urandom(12)).decode("ascii").rstrip("=")
+
+    def _group_wrap_info(self, group_id, epoch_id, sender_username, sender_device_id, recipient_username, recipient_device_id):
+        parts = [
+            b"chatpy-group-wrap-v1",
+            str(group_id).encode("utf-8"),
+            str(epoch_id).encode("utf-8"),
+            str(sender_username).encode("utf-8"),
+            str(sender_device_id).encode("utf-8"),
+            str(recipient_username).encode("utf-8"),
+            str(recipient_device_id).encode("utf-8"),
+        ]
+        return b"|".join(parts)
+
+    def _group_wrap_aad(self, group_id, epoch_id, sender_username, sender_device_id, recipient_username, recipient_device_id):
+        parts = [
+            b"chatpy-group-wrap-v1-aad",
+            str(group_id).encode("utf-8"),
+            str(epoch_id).encode("utf-8"),
+            str(sender_username).encode("utf-8"),
+            str(sender_device_id).encode("utf-8"),
+            str(recipient_username).encode("utf-8"),
+            str(recipient_device_id).encode("utf-8"),
+        ]
+        return b"|".join(parts)
+
+    def _group_wrap_sig_data(
+        self,
+        group_id,
+        epoch_id,
+        sender_username,
+        sender_device_id,
+        recipient_username,
+        recipient_device_id,
+        eph_pub_raw,
+        salt_raw,
+        nonce_raw,
+        ciphertext_raw,
+    ):
+        parts = [
+            b"chatpy-group-wrap-v1-sig",
+            str(group_id).encode("utf-8"),
+            str(epoch_id).encode("utf-8"),
+            str(sender_username).encode("utf-8"),
+            str(sender_device_id).encode("utf-8"),
+            str(recipient_username).encode("utf-8"),
+            str(recipient_device_id).encode("utf-8"),
+            eph_pub_raw,
+            salt_raw,
+            nonce_raw,
+            ciphertext_raw,
+        ]
+        return b"|".join(parts)
+
+    def _canonical_group_payload_bytes(self, payload_obj):
+        try:
+            return json.dumps(
+                payload_obj,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except Exception:
+            fallback = {"type": "text", "text": str(payload_obj)}
+            return json.dumps(
+                fallback,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+    def _group_msg_sig_data(self, group_id, epoch_id, sender_username, sender_device_id, payload_bytes):
+        parts = [
+            b"chatpy-group-msg-v1",
+            str(group_id).encode("utf-8"),
+            str(epoch_id).encode("utf-8"),
+            str(sender_username).encode("utf-8"),
+            str(sender_device_id).encode("utf-8"),
+        ]
+        return b"|".join(parts) + b"|" + payload_bytes
+
+    def _update_group_meta(self, group_obj):
+        if not isinstance(group_obj, dict):
+            return
+        gid = self._normalize_group_id(group_obj.get("group_id"))
+        if gid is None:
+            return
+        meta = dict(self.group_meta.get(gid) or {})
+        for key in ("group_uuid", "name", "owner", "role", "member_count", "history_policy", "key_epoch", "group_key"):
+            if key in group_obj:
+                meta[key] = group_obj.get(key)
+        meta["group_id"] = gid
+        self.group_meta[gid] = meta
+
+    def _is_group_owner(self, group_id):
+        gid = self._normalize_group_id(group_id)
+        if gid is None or not self.username:
+            return False
+        meta = self.group_meta.get(gid)
+        if not isinstance(meta, dict):
+            return False
+        if str(meta.get("owner") or "").strip() == self.username:
+            return True
+        return str(meta.get("role") or "").strip().lower() == "owner"
+
+    def _remember_peer_identity(self, peer, device_id, sign_pub=None, dh_pub=None):
+        if not peer or not device_id:
+            return
+        entries = self.peer_identities.get(peer, [])
+        if not isinstance(entries, list):
+            entries = []
+        found = None
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("device_id") == device_id:
+                found = entry
+                break
+        if found is None:
+            found = {"device_id": device_id}
+            entries.append(found)
+        if sign_pub:
+            found["sign_pub"] = sign_pub
+        if dh_pub:
+            found["dh_pub"] = dh_pub
+        self.peer_identities[peer] = entries
+
+    def _resolve_group_sender_sign_pub(self, sender_username, sender_device_id, sender_sign_pub, sender_dh_pub):
+        if not sender_username or not sender_device_id:
+            return None
+
+        if sender_username == self.username:
+            identity = self.ensure_identity_keys()
+            if not identity:
+                return None
+            return identity.get("sign_pub")
+
+        pinned = self.identity_pins.get_peer(sender_username)
+        record = pinned.get(sender_device_id, {}) if isinstance(pinned, dict) else {}
+        if isinstance(record, dict) and record.get("blocked"):
+            return None
+
+        peer_entry = self._find_peer_identity(sender_username, sender_device_id)
+        known_sign = peer_entry.get("sign_pub") if isinstance(peer_entry, dict) else None
+        known_dh = peer_entry.get("dh_pub") if isinstance(peer_entry, dict) else None
+
+        sign_pub = sender_sign_pub or known_sign
+        dh_pub = sender_dh_pub or known_dh
+        if not sign_pub:
+            self.request_identity_keys(sender_username)
+            return None
+
+        fp = fingerprint_ed25519_pub(sign_pub)
+        if not fp:
+            return None
+
+        if known_sign and sign_pub != known_sign:
+            self.identity_pins.set_device_blocked(sender_username, sender_device_id, True)
+            self._emit_identity_key_notice(sender_username, sender_device_id, sign_pub, dh_pub)
+            return None
+        if known_dh and dh_pub and known_dh != dh_pub:
+            self.identity_pins.set_device_blocked(sender_username, sender_device_id, True)
+            self._emit_identity_key_notice(sender_username, sender_device_id, sign_pub, dh_pub)
+            return None
+
+        if isinstance(record, dict) and record:
+            if record.get("sign_fp") and record.get("sign_fp") != fp:
+                self.identity_pins.set_device_blocked(sender_username, sender_device_id, True)
+                self._emit_identity_key_notice(sender_username, sender_device_id, sign_pub, dh_pub)
+                return None
+            if dh_pub and record.get("dh_pub") and record.get("dh_pub") != dh_pub:
+                self.identity_pins.set_device_blocked(sender_username, sender_device_id, True)
+                self._emit_identity_key_notice(sender_username, sender_device_id, sign_pub, dh_pub)
+                return None
+        else:
+            self.identity_pins.pin_device(sender_username, sender_device_id, fp, dh_pub)
+            self._emit_identity_key_notice(sender_username, sender_device_id, sign_pub, dh_pub)
+
+        self._remember_peer_identity(sender_username, sender_device_id, sign_pub=sign_pub, dh_pub=dh_pub)
+        return sign_pub
+
+    def _wrap_group_key_for_device(self, group_id, epoch_id, group_key_bytes, recipient_username, recipient_device_id, recipient_dh_pub_b64):
+        gid = self._normalize_group_id(group_id)
+        epoch = str(epoch_id or "").strip()
+        if gid is None or not epoch or not recipient_username or not recipient_device_id:
+            return None
+        if not isinstance(group_key_bytes, (bytes, bytearray)) or len(group_key_bytes) != 32:
+            return None
+        if not recipient_dh_pub_b64:
+            return None
+
+        identity = self.ensure_identity_keys()
+        privs = self._load_identity_private()
+        if not identity or not privs:
+            return None
+        sign_priv, _ = privs
+        if not sign_priv:
+            return None
+
+        sender_username = self.username or ""
+        sender_device_id = identity.get("device_id")
+        sender_sign_pub = identity.get("sign_pub")
+        sender_dh_pub = identity.get("dh_pub")
+        if not sender_device_id or not sender_sign_pub or not sender_dh_pub:
+            return None
+
+        try:
+            peer_pub = load_public_key(base64.b64decode(recipient_dh_pub_b64))
+        except Exception:
+            return None
+
+        from cryptography.hazmat.primitives.asymmetric import x25519
+        eph_priv = x25519.X25519PrivateKey.generate()
+        eph_pub_raw = eph_priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        salt_raw = os.urandom(32)
+        try:
+            shared = eph_priv.exchange(peer_pub)
+        except Exception:
+            return None
+
+        info = self._group_wrap_info(
+            gid,
+            epoch,
+            sender_username,
+            sender_device_id,
+            recipient_username,
+            recipient_device_id,
+        )
+        wrap_key = hkdf_derive(shared, salt_raw, info, length=32)
+        aad = self._group_wrap_aad(
+            gid,
+            epoch,
+            sender_username,
+            sender_device_id,
+            recipient_username,
+            recipient_device_id,
+        )
+        enc = encrypt_msg(wrap_key, bytes(group_key_bytes), aad=aad)
+        if not isinstance(enc, dict):
+            return None
+
+        try:
+            nonce_raw = base64.b64decode(enc.get("nonce", ""))
+            ciphertext_raw = base64.b64decode(enc.get("ciphertext", ""))
+        except Exception:
+            return None
+
+        sig_data = self._group_wrap_sig_data(
+            gid,
+            epoch,
+            sender_username,
+            sender_device_id,
+            recipient_username,
+            recipient_device_id,
+            eph_pub_raw,
+            salt_raw,
+            nonce_raw,
+            ciphertext_raw,
+        )
+        sig_raw = sign_priv.sign(sig_data)
+        payload = {
+            "version": "group_key_wrap_v1",
+            "group_id": gid,
+            "epoch_id": epoch,
+            "sender_username": sender_username,
+            "sender_device_id": sender_device_id,
+            "sender_sign_pub": sender_sign_pub,
+            "sender_dh_pub": sender_dh_pub,
+            "recipient_username": recipient_username,
+            "recipient_device_id": recipient_device_id,
+            "eph_pub": base64.b64encode(eph_pub_raw).decode("ascii"),
+            "salt": base64.b64encode(salt_raw).decode("ascii"),
+            "enc": enc,
+            "sig": base64.b64encode(sig_raw).decode("ascii"),
+        }
+        return {
+            "recipient_username": recipient_username,
+            "recipient_device_id": recipient_device_id,
+            "payload": payload,
+        }
+
+    def _unwrap_group_key_envelope(self, group_id, envelope):
+        gid = self._normalize_group_id(group_id)
+        if gid is None or not isinstance(envelope, dict):
+            return False
+
+        payload = envelope.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("envelope"), dict):
+            payload = payload.get("envelope")
+        if not isinstance(payload, dict):
+            return False
+        if str(payload.get("version") or "").strip() != "group_key_wrap_v1":
+            return False
+
+        epoch_id = str(payload.get("epoch_id") or envelope.get("epoch_id") or "").strip()
+        sender_username = str(payload.get("sender_username") or envelope.get("sender_username") or "").strip()
+        sender_device_id = str(payload.get("sender_device_id") or envelope.get("sender_device_id") or "").strip()
+        sender_sign_pub = payload.get("sender_sign_pub")
+        sender_dh_pub = payload.get("sender_dh_pub")
+        recipient_username = str(payload.get("recipient_username") or envelope.get("recipient_username") or "").strip()
+        recipient_device_id = str(payload.get("recipient_device_id") or envelope.get("recipient_device_id") or "").strip()
+
+        if not epoch_id or not sender_username or not sender_device_id:
+            return False
+        if recipient_username and self.username and recipient_username != self.username:
+            return False
+
+        my_device_id = self.identity_mgr.get_device_id()
+        if recipient_device_id and recipient_device_id != my_device_id:
+            return False
+
+        enc = payload.get("enc")
+        eph_pub_b64 = payload.get("eph_pub")
+        salt_b64 = payload.get("salt")
+        sig_b64 = payload.get("sig")
+        if not isinstance(enc, dict) or not eph_pub_b64 or not salt_b64 or not sig_b64:
+            return False
+
+        trusted_sign_pub = self._resolve_group_sender_sign_pub(
+            sender_username,
+            sender_device_id,
+            sender_sign_pub,
+            sender_dh_pub,
+        )
+        if not trusted_sign_pub:
+            return False
+
+        try:
+            eph_pub_raw = base64.b64decode(eph_pub_b64)
+            salt_raw = base64.b64decode(salt_b64)
+            sig_raw = base64.b64decode(sig_b64)
+            nonce_raw = base64.b64decode(enc.get("nonce", ""))
+            ciphertext_raw = base64.b64decode(enc.get("ciphertext", ""))
+        except Exception:
+            return False
+
+        sig_data = self._group_wrap_sig_data(
+            gid,
+            epoch_id,
+            sender_username,
+            sender_device_id,
+            recipient_username or (self.username or ""),
+            recipient_device_id or my_device_id,
+            eph_pub_raw,
+            salt_raw,
+            nonce_raw,
+            ciphertext_raw,
+        )
+        try:
+            pub = load_ed25519_public_key(base64.b64decode(trusted_sign_pub))
+            pub.verify(sig_raw, sig_data)
+        except Exception:
+            self.identity_pins.set_device_blocked(sender_username, sender_device_id, True)
+            self._emit_identity_key_notice(sender_username, sender_device_id, trusted_sign_pub, sender_dh_pub)
+            return False
+
+        privs = self._load_identity_private()
+        if not privs:
+            return False
+        _, dh_priv = privs
+
+        try:
+            eph_pub_key = load_public_key(eph_pub_raw)
+            shared = dh_priv.exchange(eph_pub_key)
+        except Exception:
+            return False
+
+        info = self._group_wrap_info(
+            gid,
+            epoch_id,
+            sender_username,
+            sender_device_id,
+            recipient_username or (self.username or ""),
+            recipient_device_id or my_device_id,
+        )
+        wrap_key = hkdf_derive(shared, salt_raw, info, length=32)
+        aad = self._group_wrap_aad(
+            gid,
+            epoch_id,
+            sender_username,
+            sender_device_id,
+            recipient_username or (self.username or ""),
+            recipient_device_id or my_device_id,
+        )
+        try:
+            group_key = decrypt_msg(wrap_key, enc, aad=aad)
+        except Exception:
+            return False
+        if not isinstance(group_key, (bytes, bytearray)) or len(group_key) != 32:
+            return False
+
+        key_b64 = base64.b64encode(bytes(group_key)).decode("ascii")
+        return self.set_group_key(gid, epoch_id, key_b64, set_current=True)
+
+    def _ingest_group_key_envelopes(self, group_id, envelopes):
+        gid = self._normalize_group_id(group_id)
+        if gid is None or not isinstance(envelopes, list):
+            return False
+        changed = False
+        for envelope in envelopes:
+            try:
+                if self._unwrap_group_key_envelope(gid, envelope):
+                    changed = True
+            except Exception:
+                continue
+        if changed:
+            self._group_rekey_required.discard(gid)
+        return changed
+
+    def _publish_pending_group_epoch(self, group_id, member_keys):
+        gid = self._normalize_group_id(group_id)
+        if gid is None:
+            return False
+        pending = self._group_publish_pending.get(gid)
+        if not isinstance(pending, dict):
+            return False
+
+        epoch_id = str(pending.get("epoch_id") or "").strip()
+        group_key = pending.get("group_key")
+        reason = str(pending.get("reason") or "group_rekey").strip()
+        if not epoch_id or not isinstance(group_key, (bytes, bytearray)) or len(group_key) != 32:
+            return False
+
+        identity = self.ensure_identity_keys()
+        if not identity:
+            return False
+
+        envelopes = []
+        seen = set()
+        members = member_keys if isinstance(member_keys, list) else []
+        for item in members:
+            if not isinstance(item, dict):
+                continue
+            username = str(item.get("username") or "").strip()
+            device_id = str(item.get("device_id") or "").strip()
+            sign_pub = item.get("sign_pub")
+            dh_pub = item.get("dh_pub")
+            if not username or not device_id or not dh_pub:
+                continue
+            if (username, device_id) in seen:
+                continue
+            seen.add((username, device_id))
+            self._remember_peer_identity(username, device_id, sign_pub=sign_pub, dh_pub=dh_pub)
+            envelope = self._wrap_group_key_for_device(
+                gid,
+                epoch_id,
+                bytes(group_key),
+                username,
+                device_id,
+                dh_pub,
+            )
+            if envelope:
+                envelopes.append(envelope)
+
+        me = self.username or ""
+        my_device = identity.get("device_id")
+        my_dh_pub = identity.get("dh_pub")
+        if me and my_device and my_dh_pub and (me, my_device) not in seen:
+            envelope = self._wrap_group_key_for_device(
+                gid,
+                epoch_id,
+                bytes(group_key),
+                me,
+                my_device,
+                my_dh_pub,
+            )
+            if envelope:
+                envelopes.append(envelope)
+
+        if not envelopes:
+            pending["state"] = "waiting_member_keys"
+            pending["updated_at"] = time.time()
+            self._group_publish_pending[gid] = pending
+            return False
+
+        pending["state"] = "publishing"
+        pending["updated_at"] = time.time()
+        pending["envelope_count"] = len(envelopes)
+        self._group_publish_pending[gid] = pending
+        self.publish_group_epoch(
+            gid,
+            epoch_id,
+            envelopes,
+            sender_device_id=identity.get("device_id"),
+            reason=reason,
+        )
+        return True
+
+    def _handle_group_member_keys(self, msg):
+        gid = self._normalize_group_id(msg.get("group_id"))
+        if gid is None:
+            return
+        members = msg.get("members", [])
+        if not isinstance(members, list):
+            members = []
+        self.group_member_keys[gid] = members
+        self._publish_pending_group_epoch(gid, members)
+
+    def ensure_group_epoch_published(self, group_id, reason="group_rekey", force_new=False):
+        if not self.group_e2e_v2_enabled:
+            return False
+        gid, session = self._ensure_group_session(group_id)
+        if gid is None or not session:
+            return False
+
+        existing = self._group_publish_pending.get(gid)
+        if isinstance(existing, dict) and not force_new:
+            state = str(existing.get("state") or "")
+            updated_at = float(existing.get("updated_at") or 0.0)
+            if state in ("requested", "waiting_member_keys", "publishing") and (time.time() - updated_at) < 15:
+                return True
+
+        epoch_id = None
+        key_bytes = None
+        if not force_new:
+            current = session.get("current")
+            epochs = session.get("epochs", {})
+            candidate = epochs.get(current) if isinstance(epochs, dict) and current else None
+            if isinstance(candidate, (bytes, bytearray)) and len(candidate) == 32:
+                epoch_id = str(current)
+                key_bytes = bytes(candidate)
+
+        if key_bytes is None:
+            epoch_id = self._new_group_epoch_id()
+            key_bytes = os.urandom(32)
+            self.set_group_key(gid, epoch_id, base64.b64encode(key_bytes).decode("ascii"), set_current=True)
+
+        pending = {
+            "epoch_id": epoch_id,
+            "group_key": bytes(key_bytes),
+            "reason": str(reason or "group_rekey"),
+            "state": "requested",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        self._group_publish_pending[gid] = pending
+        self.request_group_member_keys(gid)
+        return True
 
     def _ensure_group_session(self, group_id):
         gid = self._normalize_group_id(group_id)
@@ -448,6 +1089,11 @@ class ClientNetwork:
         if set_current:
             session["current"] = epoch
         self.group_sessions[gid] = session
+        self._group_rekey_required.discard(gid)
+        meta = self.group_meta.get(gid)
+        if isinstance(meta, dict):
+            meta["key_epoch"] = epoch
+            self.group_meta[gid] = meta
         if self.username:
             try:
                 self.group_store.set_epoch(self.username, gid, epoch, key_bytes, set_current=set_current)
@@ -460,6 +1106,10 @@ class ClientNetwork:
         if gid is None:
             return
         self.group_sessions.pop(gid, None)
+        self.group_key_envelopes.pop(gid, None)
+        self.group_member_keys.pop(gid, None)
+        self._group_publish_pending.pop(gid, None)
+        self._group_rekey_required.discard(gid)
         if self.username:
             try:
                 self.group_store.remove_group(self.username, gid)
@@ -469,16 +1119,30 @@ class ClientNetwork:
     def ingest_group_crypto(self, group_obj):
         if not isinstance(group_obj, dict):
             return False
-        return self.set_group_key(
+        applied = self.set_group_key(
             group_obj.get("group_id"),
             group_obj.get("key_epoch"),
             group_obj.get("group_key"),
             set_current=True,
         )
+        if not applied and self.group_e2e_v2_enabled:
+            gid = self._normalize_group_id(group_obj.get("group_id"))
+            if gid is not None:
+                self.request_group_key_envelopes(gid, epoch_id=group_obj.get("key_epoch"))
+        return applied
 
     def encrypt_group_payload(self, group_id, payload_obj):
         gid, session = self._ensure_group_session(group_id)
         if gid is None or not session:
+            return None
+        if self.group_e2e_v2_enabled and gid in self._group_rekey_required:
+            if self._is_group_owner(gid):
+                self.ensure_group_epoch_published(
+                    gid,
+                    reason="rekey_required",
+                    force_new=True,
+                )
+            self.request_group_key_envelopes(gid)
             return None
         epoch = session.get("current")
         epochs = session.get("epochs", {})
@@ -487,12 +1151,54 @@ class ClientNetwork:
             session["current"] = epoch
         key_bytes = epochs.get(epoch) if isinstance(epochs, dict) else None
         if not epoch or not key_bytes:
+            if self.group_e2e_v2_enabled:
+                if self._is_group_owner(gid):
+                    self.ensure_group_epoch_published(
+                        gid,
+                        reason="send_missing_key",
+                        force_new=False,
+                    )
+                self.request_group_key_envelopes(gid, epoch_id=epoch)
             return None
         aad = self._group_aad(gid, epoch)
-        try:
-            plaintext = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
-        except Exception:
-            plaintext = json.dumps({"type": "text", "text": str(payload_obj)}, ensure_ascii=False).encode("utf-8")
+        if not isinstance(payload_obj, dict):
+            payload_obj = {"type": "text", "text": str(payload_obj)}
+        payload_base = dict(payload_obj)
+        payload_base.pop("_sig", None)
+
+        identity = self.ensure_identity_keys()
+        privs = self._load_identity_private()
+        if not identity or not privs or not privs[0]:
+            return None
+        sign_priv, _ = privs
+
+        sender_username = self.username or ""
+        sender_device_id = identity.get("device_id")
+        sender_sign_pub = identity.get("sign_pub")
+        sender_dh_pub = identity.get("dh_pub")
+        if not sender_device_id or not sender_sign_pub:
+            return None
+
+        payload_bytes = self._canonical_group_payload_bytes(payload_base)
+        sig_data = self._group_msg_sig_data(
+            gid,
+            epoch,
+            sender_username,
+            sender_device_id,
+            payload_bytes,
+        )
+        sig_raw = sign_priv.sign(sig_data)
+        payload_signed = dict(payload_base)
+        payload_signed["_sig"] = {
+            "v": "group_msg_sig_v1",
+            "sender_username": sender_username,
+            "sender_device_id": sender_device_id,
+            "sender_sign_pub": sender_sign_pub,
+            "sender_dh_pub": sender_dh_pub,
+            "sig": base64.b64encode(sig_raw).decode("ascii"),
+        }
+
+        plaintext = json.dumps(payload_signed, ensure_ascii=False).encode("utf-8")
         enc = encrypt_msg(key_bytes, plaintext, aad=aad)
         return {
             "purpose": "group_v1",
@@ -500,7 +1206,7 @@ class ClientNetwork:
             "enc": enc,
         }
 
-    def decrypt_group_payload(self, group_id, payload_obj):
+    def decrypt_group_payload(self, group_id, payload_obj, sender_username=None, require_sig=False):
         if not isinstance(payload_obj, dict) or payload_obj.get("purpose") != "group_v1":
             return payload_obj
         gid, session = self._ensure_group_session(group_id)
@@ -527,19 +1233,86 @@ class ClientNetwork:
                 self.group_sessions[gid] = session
 
         if key_bytes is None:
+            cached = self.group_key_envelopes.get(gid, [])
+            if isinstance(cached, list) and cached:
+                self._ingest_group_key_envelopes(gid, cached)
+                epochs = session.get("epochs", {})
+                if isinstance(epochs, dict):
+                    key_bytes = epochs.get(epoch) if epoch else None
+
+        if key_bytes is None:
             current = session.get("current")
             key_bytes = epochs.get(current) if current else None
             if key_bytes is not None:
                 epoch = current
         if key_bytes is None or not epoch:
+            if self.group_e2e_v2_enabled:
+                self.request_group_key_envelopes(gid, epoch_id=payload_obj.get("epoch_id"))
             raise RuntimeError("Group key is unavailable")
 
         aad = self._group_aad(gid, epoch)
         plaintext = decrypt_msg(key_bytes, enc, aad=aad)
         try:
-            return json.loads(plaintext.decode("utf-8"))
+            decoded = json.loads(plaintext.decode("utf-8"))
         except Exception:
             return plaintext.decode("utf-8", errors="replace")
+
+        if not isinstance(decoded, dict):
+            return decoded
+
+        sig_meta = decoded.get("_sig")
+        if sig_meta is None:
+            if require_sig:
+                raise RuntimeError("Missing group message signature")
+            return decoded
+        if not isinstance(sig_meta, dict):
+            raise RuntimeError("Invalid group message signature")
+
+        sig_ver = str(sig_meta.get("v") or "").strip()
+        if sig_ver != "group_msg_sig_v1":
+            raise RuntimeError("Unsupported group signature version")
+
+        sig_b64 = sig_meta.get("sig")
+        sender_device_id = str(sig_meta.get("sender_device_id") or "").strip()
+        sender_sign_pub = sig_meta.get("sender_sign_pub")
+        sender_dh_pub = sig_meta.get("sender_dh_pub")
+        sender_from_sig = str(sig_meta.get("sender_username") or "").strip()
+
+        resolved_sender = sender_from_sig or (sender_username or "")
+        if sender_username and sender_from_sig and sender_username != sender_from_sig:
+            raise RuntimeError("Group sender mismatch")
+        if not resolved_sender or not sender_device_id or not sig_b64:
+            raise RuntimeError("Invalid group message signature")
+
+        trusted_sign_pub = self._resolve_group_sender_sign_pub(
+            resolved_sender,
+            sender_device_id,
+            sender_sign_pub,
+            sender_dh_pub,
+        )
+        if not trusted_sign_pub:
+            raise RuntimeError("Untrusted group sender key")
+
+        payload_base = dict(decoded)
+        payload_base.pop("_sig", None)
+        payload_bytes = self._canonical_group_payload_bytes(payload_base)
+        sig_data = self._group_msg_sig_data(
+            gid,
+            epoch,
+            resolved_sender,
+            sender_device_id,
+            payload_bytes,
+        )
+        try:
+            sig_raw = base64.b64decode(sig_b64)
+            pub = load_ed25519_public_key(base64.b64decode(trusted_sign_pub))
+            pub.verify(sig_raw, sig_data)
+        except Exception:
+            self.identity_pins.set_device_blocked(resolved_sender, sender_device_id, True)
+            self._emit_identity_key_notice(resolved_sender, sender_device_id, trusted_sign_pub, sender_dh_pub)
+            raise RuntimeError("Invalid group message signature")
+
+        return payload_base
 
     def ensure_identity_keys(self):
         if not self.username:
@@ -1194,7 +1967,8 @@ class ClientNetwork:
             "msg_count": 0,
             "rekey_after": self._rekey_after,
             "established": False,
-            "sent_response": False
+            "sent_response": False,
+            "peer_device_id": None,
         }
 
     def start_secure_session(self, peer, initiator=True, rekey=False):
@@ -1226,7 +2000,7 @@ class ClientNetwork:
     def has_pending_exchange(self, peer):
         return peer in self.pending_exchanges
 
-    def _send_key_exchange(self, peer, session, is_response=False, rekey=False):
+    def _send_key_exchange(self, peer, session, is_response=False, rekey=False, target_device_id=None):
         identity = self.ensure_identity_keys()
         if not identity:
             return
@@ -1234,7 +2008,9 @@ class ClientNetwork:
         if not sign_priv:
             return
 
-        peer_device_id, _ = self._select_peer_device(peer)
+        peer_device_id = target_device_id
+        if not peer_device_id and is_response and isinstance(session, dict):
+            peer_device_id = session.get("peer_device_id")
         sig_data = self._secure_sig_data(
             self.username or "",
             peer,
@@ -1368,6 +2144,8 @@ class ClientNetwork:
             if session is not None and incoming_sid:
                 session["session_id"] = incoming_sid
 
+        session["peer_device_id"] = device_id
+
         session["their_pub"] = peer_pub
         try:
             shared = ecdh_shared_secret(session["my_priv"], peer_pub)
@@ -1381,7 +2159,13 @@ class ClientNetwork:
 
         if not msg.get("response") and not session["initiator"] and not session["sent_response"]:
             session["sent_response"] = True
-            self._send_key_exchange(peer, session, is_response=True, rekey=rekey)
+            self._send_key_exchange(
+                peer,
+                session,
+                is_response=True,
+                rekey=rekey,
+                target_device_id=device_id,
+            )
 
         try:
             self.signals.secure_session_established.emit(peer)
@@ -1509,6 +2293,51 @@ class ClientNetwork:
             "type": "get_group_history",
             "group_id": group_id
         })
+
+    def request_group_member_keys(self, group_id):
+        self.send({
+            "type": "get_group_member_keys",
+            "group_id": group_id
+        })
+
+    def publish_group_epoch(self, group_id, epoch_id, envelopes, sender_device_id=None, reason=None):
+        gid = self._normalize_group_id(group_id)
+        identity = self.identity if isinstance(self.identity, dict) else None
+        if not sender_device_id:
+            if identity is None:
+                identity = self.ensure_identity_keys()
+            if isinstance(identity, dict):
+                sender_device_id = identity.get("device_id")
+        payload = {
+            "type": "group_publish_epoch",
+            "group_id": gid if gid is not None else group_id,
+            "epoch_id": epoch_id,
+            "sender_device_id": sender_device_id,
+            "envelopes": envelopes if isinstance(envelopes, list) else []
+        }
+        if reason:
+            payload["reason"] = str(reason)
+        self.send(payload)
+        if gid is not None:
+            pending = self._group_publish_pending.get(gid)
+            if isinstance(pending, dict):
+                pending["state"] = "publishing"
+                pending["updated_at"] = time.time()
+                self._group_publish_pending[gid] = pending
+
+    def request_group_key_envelopes(self, group_id, epoch_id=None, since_id=None, limit=None):
+        gid = self._normalize_group_id(group_id)
+        payload = {
+            "type": "get_group_key_envelopes",
+            "group_id": gid if gid is not None else group_id
+        }
+        if epoch_id:
+            payload["epoch_id"] = epoch_id
+        if since_id is not None:
+            payload["since_id"] = since_id
+        if limit is not None:
+            payload["limit"] = limit
+        self.send(payload)
 
     def send_group_message(self, group_id, payload, secure_mode=False):
         self.send({
